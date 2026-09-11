@@ -1,22 +1,79 @@
 # ARM64 Android Build Environment Setup Script
 
-An automated, robust Shell Script designed to set up a complete ARM64 Android build environment across various Linux distributions and Termux. It installs necessary build tools, sets up Java 21, configures official Android SDK components, handles AAPT2 workarounds, and safely overrides Gradle configurations without modifying project source code.
-
-## 🌟 Key Features
-
-- **Automated OS & Package Manager Detection:** Supports **Termux**, **Debian/Ubuntu**, **Arch Linux**, **Fedora**, and **Alpine Linux**.
-- **Architecture Enforcement:** Strict validation to ensure the host system is **ARM64 (`aarch64`)**.
-- **JDK Management:** Automatically checks and installs **OpenJDK 21** (ensuring version $\ge 17$) and configures `JAVA_HOME` and `update-alternatives`.
-- **Android SDK Setup:** Automatically downloads Google's command-line tools, accepts SDK licenses, and installs `platform-tools`, `platforms;android-35`, and `build-tools;35.0.0`.
-- **Modern AAPT2 Compatibility:** Handles outdated system AAPT2 binaries by offering automated download and validation of **ReVanced ARM64 AAPT2** binary (supporting `--source-path`).
-- **Non-Intrusive Gradle Overrides:** Safely hooks into `~/.gradle/gradle.properties` and `~/.gradle/init.d/` to override AAPT2 globally without altering project files.
+An automated, lightweight Shell Script designed to set up a complete Android build environment on **ARM64 (aarch64)** systems across any Linux distribution and Termux (Ubuntu, Debian, Arch, Fedora, Alpine, Termux, etc.).
 
 ---
 
-## 🚀 Quick Start
+## 🌐 GitHub Repository & Source File
 
-### 1. Clone the Repository
-```bash
-git clone https://github.com/deepanjanxyz/Setup-Android-build-environment.git
-cd Setup-Android-build-environment
+- **Repository:** https://github.com/deepanjanxyz/Setup-Android-build-environment
+- **Script File:** https://github.com/deepanjanxyz/Setup-Android-build-environment/blob/main/Install.sh
 
+---
+
+## ⚡ Quick One-Line Installation & Execution
+
+Before running, ensure `curl` or `wget` is installed on your system.
+
+### Step 1: Install Pre-requisites (If not already installed)
+
+- **For Debian / Ubuntu / Linux Mint (Root User):**
+    apt update && apt install -y curl wget git
+
+- **For Debian / Ubuntu (Sudo / Non-Root User):**
+    sudo apt update && sudo apt install -y curl wget git
+
+- **For Termux Users:**
+    pkg update && pkg install -y curl wget git
+
+---
+
+### Step 2: Run Installation Command
+
+Choose the command according to your system privilege:
+
+#### Option A: For Sudo Users (Ubuntu, Debian Sudo, Raspberry Pi OS)
+
+    sudo bash -c "$(curl -sSL https://raw.githubusercontent.com/deepanjanxyz/Setup-Android-build-environment/main/Install.sh)"
+
+#### Option B: For Pure Root Users (Direct Root Terminal / Debian Root)
+
+    bash -c "$(curl -sSL https://raw.githubusercontent.com/deepanjanxyz/Setup-Android-build-environment/main/Install.sh)"
+
+#### Option C: For Termux Users
+
+    bash -c "$(curl -sSL https://raw.githubusercontent.com/deepanjanxyz/Setup-Android-build-environment/main/Install.sh)"
+
+---
+
+## 🛑 Processor Architecture Requirements
+
+This script is specifically written and patched for **ARM64 Architecture**. Please verify your device architecture before running:
+
+| Architecture | Compatibility Status | Instruction |
+| :--- | :--- | :--- |
+| **ARM64 / AArch64** (`aarch64` / `arm64`) | ✅ **Fully Supported** | Ideal for Termux (Android devices), Raspberry Pi 4/5, Apple Silicon Linux VMs, and ARM Single Board Computers. |
+| **x86_64 / AMD64** (`x86_64`) | ❌ **Not Supported** | Do **NOT** run on standard 64-bit Intel/AMD PCs. Standard x86_64 systems do not require custom ARM64 AAPT2 binary overrides. |
+
+To check your system architecture, run:
+
+    uname -m
+
+*If it returns `aarch64` or `arm64`, your system is fully compatible.*
+
+---
+
+## 🛠 Supported Operating Systems
+
+This installer is **Universal** and automatically detects your distribution's package manager:
+- **Termux** (`pkg`)
+- **Debian / Ubuntu / Kali / Mint** (`apt`)
+- **Arch Linux / Manjaro** (`pacman`)
+- **Fedora / RHEL** (`dnf`)
+- **Alpine Linux** (`apk`)
+
+---
+
+## 👤 Author
+
+Developed & Maintained by **[deepanjanxyz](https://github.com/deepanjanxyz)**
