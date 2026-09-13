@@ -226,16 +226,22 @@ install_java() {
     # Set Java 21 as default if multiple versions exist (Linux only)
     if [[ "${OS_NAME}" != "termux" && -x "/usr/sbin/update-alternatives" ]]; then
         local jdk21_bin=""
+        local jdk21_javac=""
         for dir in /usr/lib/jvm/*21*; do
             if [[ -x "${dir}/bin/java" ]]; then
                 jdk21_bin="${dir}/bin/java"
+                jdk21_javac="${dir}/bin/javac"
                 break
             fi
         done
         if [[ -n "${jdk21_bin}" ]]; then
             info "Setting Java 21 as default via update-alternatives..."
             update-alternatives --set java "${jdk21_bin}" || warn "update-alternatives failed, but continuing."
-            update-alternatives --set javac "${jdk21_bin/javac}" || warn "Failed to set javac alternative."
+            if [[ -x "${jdk21_javac}" ]]; then
+                update-alternatives --set javac "${jdk21_javac}" || warn "Failed to set javac alternative."
+            else
+                warn "javac not found in JDK 21 directory; skipping javac alternative."
+            fi
         else
             warn "Could not locate JDK 21 directory for alternatives."
         fi
