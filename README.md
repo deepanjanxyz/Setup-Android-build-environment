@@ -46,6 +46,12 @@ Choose the command according to your system privilege:
 
 ---
 
+## 📦 Exporting Your Built APK (Termux Users)
+
+Finished building an APK inside Termux and can't find it on your phone? See the step-by-step **[EXPORT-APK.md](EXPORT-APK.md)** guide — it covers granting Termux storage access with `termux-setup-storage`, copying the APK to your phone's Downloads folder, and locating it with your file manager.
+
+---
+
 ## 🛑 Processor Architecture Requirements
 
 This script is specifically written and patched for **ARM64 Architecture**. Please verify your device architecture before running:
