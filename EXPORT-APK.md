@@ -19,9 +19,7 @@ After running the command above, Android will show a dialog asking whether Termu
 1. Tap **Allow** (on some Android versions you may need to tap the back-arrow in the dialog first to expand it, then Allow).
 2. If you accidentally tapped **Deny**, just run `termux-setup-storage` again.
 
-> **Note:** On Android 11+ the permission is scoped: Termux gets access only to the folders it creates under `~/storage/shared` plus media collections. The `~/storage/downloads` shortcut used below works on all supported versions.
-
-When it succeeds, a `storage` directory appears in your Termux home. Verify it:
+When it succeeds, a `storage` directory appears in your Termux home containing shortcuts to your phone's shared folders. Verify it:
 
     ls ~/storage
 
@@ -64,7 +62,9 @@ Now open your phone's **file manager** (e.g. Files by Google, Samsung My Files, 
 2. You should see `app-debug.apk` (with the file size shown).
 3. Tap it to install (you may need to allow "install from unknown sources" for your file manager), or long-press to share it via Bluetooth, WhatsApp, etc.
 
-> **Alternative without the file manager:** you can also share the APK directly from Termux using the Termux:API app, or with `termux-open ~/storage/downloads/app-debug.apk`.
+> **Alternative without the file manager:** open the APK directly from Termux — no extra app required:
+>
+>     termux-open ~/storage/downloads/app-debug.apk
 
 ---
 
