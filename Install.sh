@@ -190,7 +190,7 @@ get_java_major() {
         return
     fi
     local version_output
-    version_output="$(${java_bin} -version 2>&1 | head -n 1)"
+    version_output="$( "${java_bin}" -version 2>&1 | head -n 1 )"
     local major=""
     major=$(echo "${version_output}" | sed -n 's/.*version "\([0-9]*\)\..*/\1/p')
     if [[ -z "${major}" ]]; then
