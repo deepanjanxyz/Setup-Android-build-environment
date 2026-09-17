@@ -136,7 +136,7 @@ detect_os() {
         OS_NAME="fedora"
         PKG_MANAGER="dnf"
         INSTALL_CMD="${SUDO} dnf install -y"
-        UPDATE_CMD="dnf check-update || true"
+        UPDATE_CMD="${SUDO} dnf check-update || true"
     elif command -v apk &>/dev/null; then
         OS_NAME="alpine"
         PKG_MANAGER="apk"
