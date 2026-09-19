@@ -648,8 +648,14 @@ main() {
         check_sdk
     fi
 
-    # Install system AAPT2 (always, to have a baseline)
-    install_system_aapt2 || exit 1
+    # Install system AAPT2 (always, to have a baseline).
+    # Some distros cannot provide a system AAPT2 package (e.g. Arch's
+    # android-tools ships adb/fastboot only, no aapt2/aapt). Do not abort in
+    # that case: continue so the ReVanced AAPT2 prompt below can offer the
+    # recommended fallback instead of the script dying before it.
+    if ! install_system_aapt2; then
+        warn "System AAPT2 could not be installed. Continuing to the ReVanced AAPT2 option (recommended)."
+    fi
     check_aapt2
 
     # Prompt for ReVanced AAPT2 based on OS type
