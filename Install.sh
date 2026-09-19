@@ -19,7 +19,7 @@ set -o pipefail
 # Configuration
 # ----------------------------------------------------------------------
 TOOL_NAME="arm64-android-build-env"
-TOOL_VERSION="24.1.0"
+TOOL_VERSION="24.0.0"
 STATE_DIR="${HOME}/.local/share/${TOOL_NAME}"
 STATE_FILE="${STATE_DIR}/state.json"
 LOG_DIR="${STATE_DIR}/logs"
@@ -40,7 +40,7 @@ AAPT2_PKG_FEDORA=("aapt2" "aapt")
 AAPT2_PKG_ALPINE=("aapt2" "aapt")
 
 # Official Android SDK command line tools (Google)
-SDKMANAGER_URL="https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip"
+SDKMANAGER_URL="https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
 SDKMANAGER_SHA256=""   # optional
 
 # ReVanced modern ARM64 AAPT2 binary
@@ -94,23 +94,6 @@ debug() { log "DEBUG" "$@"; }
 # ----------------------------------------------------------------------
 detect_os() {
     info "Detecting OS and package manager..."
-
-    # ------------------------------------------------------------------
-    # Privilege detection (issue #5):
-    # When the script runs as a non-root user, prepend sudo to the
-    # system package manager commands so installation does not fail
-    # with permission errors. Termux never uses sudo (no root by design).
-    # ------------------------------------------------------------------
-    SUDO=""
-    if [[ ${EUID} -eq 0 ]]; then
-        info "Running as root; package commands will be executed directly."
-    elif command -v sudo &>/dev/null; then
-        SUDO="sudo"
-        info "Running as non-root; sudo will be used for package installation."
-    else
-        warn "Running as non-root and sudo is not available; package installation may fail."
-    fi
-
     OS_NAME="unknown"
     PKG_MANAGER="none"
     INSTALL_CMD=""
@@ -125,23 +108,23 @@ detect_os() {
     elif command -v pacman &>/dev/null; then
         OS_NAME="arch"
         PKG_MANAGER="pacman"
-        INSTALL_CMD="${SUDO} pacman -S --noconfirm"
-        UPDATE_CMD="${SUDO} pacman -Syu --noconfirm"
+        INSTALL_CMD="pacman -S --noconfirm"
+        UPDATE_CMD="pacman -Syu --noconfirm"
     elif command -v apt-get &>/dev/null; then
         OS_NAME="debian"
         PKG_MANAGER="apt-get"
-        INSTALL_CMD="${SUDO} apt-get install -y"
-        UPDATE_CMD="${SUDO} apt-get update"
+        INSTALL_CMD="apt-get install -y"
+        UPDATE_CMD="apt-get update"
     elif command -v dnf &>/dev/null; then
         OS_NAME="fedora"
         PKG_MANAGER="dnf"
-        INSTALL_CMD="${SUDO} dnf install -y"
-        UPDATE_CMD="${SUDO} dnf check-update || true"
+        INSTALL_CMD="dnf install -y"
+        UPDATE_CMD="dnf check-update || true"
     elif command -v apk &>/dev/null; then
         OS_NAME="alpine"
         PKG_MANAGER="apk"
-        INSTALL_CMD="${SUDO} apk add"
-        UPDATE_CMD="${SUDO} apk update"
+        INSTALL_CMD="apk add"
+        UPDATE_CMD="apk update"
     else
         OS_NAME="unknown"
         PKG_MANAGER="none"
@@ -190,7 +173,7 @@ get_java_major() {
         return
     fi
     local version_output
-    version_output="$( "${java_bin}" -version 2>&1 | head -n 1 )"
+    version_output="$("${java_bin}" -version 2>&1 | head -n 1)"
     local major=""
     major=$(echo "${version_output}" | sed -n 's/.*version "\([0-9]*\)\..*/\1/p')
     if [[ -z "${major}" ]]; then
@@ -253,9 +236,9 @@ install_java() {
         done
         if [[ -n "${jdk21_bin}" ]]; then
             info "Setting Java 21 as default via update-alternatives..."
-            ${SUDO} update-alternatives --set java "${jdk21_bin}" || warn "update-alternatives failed, but continuing."
+            update-alternatives --set java "${jdk21_bin}" || warn "update-alternatives failed, but continuing."
             if [[ -x "${jdk21_javac}" ]]; then
-                ${SUDO} update-alternatives --set javac "${jdk21_javac}" || warn "Failed to set javac alternative."
+                update-alternatives --set javac "${jdk21_javac}" || warn "Failed to set javac alternative."
             else
                 warn "javac not found in JDK 21 directory; skipping javac alternative."
             fi
@@ -648,14 +631,8 @@ main() {
         check_sdk
     fi
 
-    # Install system AAPT2 (always, to have a baseline).
-    # Some distros cannot provide a system AAPT2 package (e.g. Arch's
-    # android-tools ships adb/fastboot only, no aapt2/aapt). Do not abort in
-    # that case: continue so the ReVanced AAPT2 prompt below can offer the
-    # recommended fallback instead of the script dying before it.
-    if ! install_system_aapt2; then
-        warn "System AAPT2 could not be installed. Continuing to the ReVanced AAPT2 option (recommended)."
-    fi
+    # Install system AAPT2 (always, to have a baseline)
+    install_system_aapt2 || exit 1
     check_aapt2
 
     # Prompt for ReVanced AAPT2 based on OS type
