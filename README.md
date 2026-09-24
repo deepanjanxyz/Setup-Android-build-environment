@@ -80,6 +80,46 @@ This installer is **Universal** and automatically detects your distribution's pa
 
 ---
 
+## 🧰 AAPT2 Handling (modern AGP compatibility)
+
+Modern Android Gradle Plugin versions invoke `aapt2 compile --source-path`, which most
+distribution-packaged AAPT2 builds do not support. The installer therefore:
+
+1. **Checks the existing local/system AAPT2 version first** — if it already meets the
+   minimum requirement (`--source-path` support, runnable on this machine), **no external
+   download happens at all**. On Termux the official repository AAPT2 usually qualifies,
+   so the ReVanced step is skipped automatically.
+2. **Falls back to the ReVanced ARM64 AAPT2 binary** only when the system AAPT2 is below
+   the requirement. The download is verified (ELF binary, size, capability probe) before
+   it is accepted.
+3. **Never fails the installation** — if the ReVanced download or validation fails, the
+   script keeps the best available AAPT2, still configures Gradle and always exits with
+   status 0.
+4. **Wires the verified binary into Gradle** — the chosen path is written to
+   `~/.gradle/gradle.properties` (`android.aapt2FromMavenOverride`), the
+   `~/.gradle/init.d/aapt2_override.init.gradle.kts` init script (which now prefers the
+   verified binary instead of the SDK's x86_64-only build-tools AAPT2) and
+   `GRADLE_OPTS`.
+
+---
+
+## 🌍 Reusing the Environment (CI, scripts, Termux)
+
+The installer writes a portable environment file at:
+
+    ~/.local/share/arm64-android-build-env/env.sh
+
+Source it in any shell, CI step or script to get `ANDROID_HOME`, `ANDROID_SDK_ROOT`,
+`JAVA_HOME`, the SDK `PATH` entries and `GRADLE_OPTS` (AAPT2 override):
+
+    . "$HOME/.local/share/arm64-android-build-env/env.sh"
+
+The same variables are also appended to `~/.bashrc` / `~/.zshrc` for interactive shells.
+Non-interactive runs (CI, `curl | bash`) automatically take the recommended answers —
+no prompt input is required.
+
+---
+
 ## 👤 Author
 
 Developed & Maintained by **[deepanjanxyz](https://github.com/deepanjanxyz)**
