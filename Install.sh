@@ -55,7 +55,7 @@ REVANCED_AAPT2_URL="https://github.com/ReVanced/aapt2/releases/download/v1.1.0/a
 # Modern AGP (8.x/9.x) invokes `aapt2 compile --source-path`, so a usable
 # AAPT2 MUST support that flag. Note that every upstream AAPT2 reports
 # version "2.19-<build>" (Debian's reports "2.19-debian"), so the reliable
-# minimum-requirement test is the --source-path capability probe below;
+# minimum-requirement test is the capability probe below;
 # AAPT2_MIN_BUILD only acts as an additional floor for binaries that DO
 # report a numeric build id (it is 0 = disabled by default).
 AAPT2_MIN_BUILD=0
@@ -398,11 +398,55 @@ aapt2_supports_source_path() {
     [[ "${help_output}" == *"--source-path"* ]]
 }
 
+# Functional compatibility probe (issue #13): some distro AAPT2 builds
+# (e.g. Ubuntu's, built from AOSP 14-beta) pass the --source-path check
+# but cannot parse the resource tables of modern SDK platforms — the
+# "RES_TABLE_TYPE_TYPE entry offsets overlap actual entry data" failure.
+# Prove real-world compatibility by linking a minimal manifest against
+# the NEWEST installed android.jar. Returns 0 (pass) when no platform is
+# installed to probe against.
+aapt2_can_link_platform() {
+    local bin="$1"
+    [[ -x "${bin}" ]] || return 1
+    local sdk="${SDK_ROOT:-${ANDROID_HOME:-${ANDROID_SDK_ROOT:-${HOME}/Android/Sdk}}}"
+    local best_api=-1 best_jar="" p n
+    for p in "${sdk}"/platforms/android-*/android.jar; do
+        [[ -f "${p}" ]] || continue
+        n="$(basename "$(dirname "${p}")")"   # e.g. android-37.0
+        n="${n#android-}"; n="${n%%.*}"
+        [[ "${n}" =~ ^[0-9]+$ ]] || continue
+        if (( n > best_api )); then best_api="${n}"; best_jar="${p}"; fi
+    done
+    if [[ -z "${best_jar}" ]]; then
+        debug "No SDK platform installed yet; skipping the AAPT2 platform-link probe."
+        return 0
+    fi
+    local probe_dir probe_rc
+    probe_dir="$(mktemp -d 2>/dev/null)" || return 0
+    cat > "${probe_dir}/AndroidManifest.xml" <<'MEOF'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.aapt2probe">
+</manifest>
+MEOF
+    "${bin}" link -o "${probe_dir}/probe.apk" -I "${best_jar}" \
+        --manifest "${probe_dir}/AndroidManifest.xml" >/dev/null 2>&1
+    probe_rc=$?
+    rm -rf "${probe_dir}"
+    if [[ ${probe_rc} -ne 0 ]]; then
+        info "AAPT2 '${bin}' cannot link against ${best_jar} (resource-table incompatibility)."
+    fi
+    return ${probe_rc}
+}
+
 # Minimum-version threshold evaluation (issue #13, requirement 1).
 # A binary meets the requirement when:
 #   1. it is executable and actually runs on this machine/architecture, and
 #   2. it supports the --source-path flag required by modern AGP, and
-#   3. its build id (when one is reported) is >= AAPT2_MIN_BUILD.
+#   3. its build id (when one is reported) is >= AAPT2_MIN_BUILD, and
+#   4. it can link against the newest installed SDK platform (when one
+#      exists) — this rejects distro AAPT2s that are too old for modern
+#      android.jar resource tables.
 aapt2_meets_minimum() {
     local bin="$1" ver build
     [[ -n "${bin}" && -x "${bin}" ]] || return 1
@@ -417,6 +461,9 @@ aapt2_meets_minimum() {
     build="$(aapt2_build_number "${bin}")"
     if [[ -n "${build}" && "${AAPT2_MIN_BUILD}" -gt 0 && "${build}" -lt "${AAPT2_MIN_BUILD}" ]]; then
         info "AAPT2 '${bin}' (build ${build}) is below the configured minimum build ${AAPT2_MIN_BUILD}."
+        return 1
+    fi
+    if ! aapt2_can_link_platform "${bin}"; then
         return 1
     fi
     debug "'${bin}' meets the minimum requirement (${ver:-version unknown})."
@@ -528,6 +575,26 @@ install_system_aapt2() {
 # ----------------------------------------------------------------------
 # Install Android SDK (official Google)
 # ----------------------------------------------------------------------
+# Discover the newest stable platform package name (e.g.
+# "platforms;android-37.0") advertised by sdkmanager. Falls back to an
+# empty string so the caller can use its default. Only plain stable
+# releases are considered — beta/ext/preview variants are filtered out.
+resolve_newest_platform() {
+    local sdkmanager_bin="$1" listing raw name best="" best_num=-1 num
+    listing="$("${sdkmanager_bin}" --list 2>/dev/null || true)"
+    [[ -z "${listing}" ]] && return 0
+    while IFS= read -r raw; do
+        name="${raw#platforms;android-}"
+        [[ "${name}" == "${raw}" ]] && continue
+        [[ "${name}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || continue
+        num="${name%%.*}"
+        if (( num > best_num )); then best_num="${num}"; best="${name}"; fi
+    done < <(printf '%s\n' "${listing}" | \
+        sed -n 's/^[[:space:]]*platforms;android-\([0-9][0-9]*\(\.[0-9][0-9]*\)\{0,1\}\)[[:space:]].*/platforms;android-\1/p')
+    [[ -n "${best}" ]] && echo "platforms;android-${best}"
+    return 0
+}
+
 install_sdk() {
     info "Setting up Android SDK (official Google command line tools)..."
     local sdk_root="${SDK_ROOT:-${HOME}/Android/Sdk}"
@@ -563,8 +630,16 @@ install_sdk() {
     info "Installing platform-tools..."
     yes | "${sdkmanager_bin}" --sdk_root="${sdk_root}" "platform-tools" > /dev/null
 
-    info "Installing platform android-35 and build-tools 35.0.0..."
-    yes | "${sdkmanager_bin}" --sdk_root="${sdk_root}" "platforms;android-35" "build-tools;35.0.0" > /dev/null
+    # Install the newest stable platform available (issue #13): a modern
+    # android.jar on disk is required both for building current apps and
+    # for the AAPT2 minimum-requirement probe. Older platforms that a
+    # specific project needs are auto-downloaded by AGP (licenses are
+    # accepted above).
+    local platform_pkg
+    platform_pkg="$(resolve_newest_platform "${sdkmanager_bin}")"
+    [[ -z "${platform_pkg}" ]] && platform_pkg="platforms;android-37.0"
+    info "Installing ${platform_pkg} and build-tools 35.0.0..."
+    yes | "${sdkmanager_bin}" --sdk_root="${sdk_root}" "${platform_pkg}" "build-tools;35.0.0" > /dev/null
 
     SDK_ROOT="${sdk_root}"
     SDK_STATUS="VALID"
