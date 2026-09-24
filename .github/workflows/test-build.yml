@@ -1,0 +1,53 @@
+name: Test ARM64 Build Environment Setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_repo_url:
+        description: 'Target Android Project Git URL'
+        required: false
+        default: 'https://github.com/deepanjanxyz/notepad.git'
+
+jobs:
+  test-setup-and-build:
+    runs-on: ubuntu-24.04-arm
+    # Security Fix 1: Restrict job token permissions to read-only
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          # Security Fix 2: Do not persist git credentials on runner
+          persist-credentials: false
+
+      - name: Make Script Executable & Run Setup (Non-Interactive)
+        run: |
+          chmod +x Install.sh
+          # Functional Fix: Pass auto-confirmation 'y' to prevent silent skip
+          echo "y" | ./Install.sh
+
+      - name: Verify Environment
+        run: |
+          echo "Architecture Check:"
+          uname -m
+          echo "Java Version:"
+          java -version
+
+      - name: Clone & Build Target App
+        # Security Fix 3: Pass inputs via env variable to prevent shell injection
+        env:
+          TEST_REPO_URL: ${{ github.event.inputs.test_repo_url }}
+        run: |
+          git clone -- "$TEST_REPO_URL" test-project
+          cd test-project
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+
+      - name: Upload Built APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: built-apk
+          path: test-project/app/build/outputs/apk/debug/*.apk
+          
