@@ -1,0 +1,44 @@
+name: Test ARM64 Build Environment Setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_repo_url:
+        description: 'Target Android Project Git URL'
+        required: false
+        default: 'https://github.com/deepanjanxyz/notepad.git'
+
+jobs:
+  test-setup-and-build:
+    # Direct Native ARM64 Architecture Runner
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Make Script Executable & Run Setup
+        run: |
+          chmod +x Install.sh
+          ./Install.sh
+
+      - name: Verify Environment
+        run: |
+          echo "Architecture Check:"
+          uname -m
+          echo "Java Version:"
+          java -version
+
+      - name: Clone & Build Target App
+        run: |
+          git clone ${{ github.event.inputs.test_repo_url }} test-project
+          cd test-project
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+
+      - name: Upload Built APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: built-apk
+          path: test-project/app/build/outputs/apk/debug/*.apk
+          
