@@ -10,17 +10,23 @@ on:
 
 jobs:
   test-setup-and-build:
-    # Direct Native ARM64 Architecture Runner
     runs-on: ubuntu-24.04-arm
+    # Security Fix 1: Restrict job token permissions to read-only
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v7
+        with:
+          # Security Fix 2: Do not persist git credentials on runner
+          persist-credentials: false
 
-      - name: Make Script Executable & Run Setup
+      - name: Make Script Executable & Run Setup (Non-Interactive)
         run: |
           chmod +x Install.sh
-          ./Install.sh
+          # Functional Fix: Pass auto-confirmation 'y' to prevent silent skip
+          echo "y" | ./Install.sh
 
       - name: Verify Environment
         run: |
@@ -30,8 +36,11 @@ jobs:
           java -version
 
       - name: Clone & Build Target App
+        # Security Fix 3: Pass inputs via env variable to prevent shell injection
+        env:
+          TEST_REPO_URL: ${{ github.event.inputs.test_repo_url }}
         run: |
-          git clone ${{ github.event.inputs.test_repo_url }} test-project
+          git clone -- "$TEST_REPO_URL" test-project
           cd test-project
           chmod +x gradlew
           ./gradlew assembleDebug --stacktrace
