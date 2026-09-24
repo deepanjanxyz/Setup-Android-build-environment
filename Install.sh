@@ -19,11 +19,14 @@ set -o pipefail
 # Configuration
 # ----------------------------------------------------------------------
 TOOL_NAME="arm64-android-build-env"
-TOOL_VERSION="24.1.0"
+TOOL_VERSION="24.2.0"
 STATE_DIR="${HOME}/.local/share/${TOOL_NAME}"
 STATE_FILE="${STATE_DIR}/state.json"
 LOG_DIR="${STATE_DIR}/logs"
 LOG_FILE="${LOG_DIR}/install-$(date +%Y-%m-%d).log"
+# Sourcing this file gives any shell (or CI step) the full environment:
+# ANDROID_HOME, ANDROID_SDK_ROOT, JAVA_HOME, PATH and GRADLE_OPTS.
+ENV_FILE="${STATE_DIR}/env.sh"
 
 # Java packages (target OpenJDK 21)
 JAVA_PKG_TERMUX="openjdk-21"
@@ -45,6 +48,17 @@ SDKMANAGER_SHA256=""   # optional
 
 # ReVanced modern ARM64 AAPT2 binary
 REVANCED_AAPT2_URL="https://github.com/ReVanced/aapt2/releases/download/v1.1.0/aapt2-arm64-v8a"
+
+# ----------------------------------------------------------------------
+# AAPT2 minimum version requirement (issue #13)
+# ----------------------------------------------------------------------
+# Modern AGP (8.x/9.x) invokes `aapt2 compile --source-path`, so a usable
+# AAPT2 MUST support that flag. Note that every upstream AAPT2 reports
+# version "2.19-<build>" (Debian's reports "2.19-debian"), so the reliable
+# minimum-requirement test is the capability probe below;
+# AAPT2_MIN_BUILD only acts as an additional floor for binaries that DO
+# report a numeric build id (it is 0 = disabled by default).
+AAPT2_MIN_BUILD=0
 
 # ----------------------------------------------------------------------
 # Logging & Args
@@ -338,7 +352,7 @@ check_aapt2() {
     local bin=""
     if command -v aapt2 &>/dev/null; then bin="$(command -v aapt2)";
     elif command -v aapt &>/dev/null; then bin="$(command -v aapt)"; fi
-    if [[ -n "${bin}" ]] && aapt2_supports_source_path "${bin}"; then
+    if [[ -n "${bin}" ]] && aapt2_meets_minimum "${bin}"; then
         AAPT2_STATUS="VALID"
         AAPT2_INFO="$( ${bin} version 2>&1 | head -n1 )"
         AAPT2_PATH="${bin}"
@@ -349,12 +363,163 @@ check_aapt2() {
 }
 
 # ----------------------------------------------------------------------
-# AAPT2 support check
+# AAPT2 support checks / minimum version threshold (issue #13)
 # ----------------------------------------------------------------------
-aapt2_supports_source_path() {
+
+# Raw first line of `aapt2 version`, e.g. "Android Asset Packaging Tool
+# (aapt) 2.19-11315950" or "2.19-debian". Fails (returns 1) when the
+# binary cannot be executed at all (missing, wrong architecture, ...).
+aapt2_version_string() {
     local bin="$1"
     [[ -x "${bin}" ]] || return 1
-    "${bin}" compile --help 2>&1 | grep -q -- '--source-path'
+    "${bin}" version 2>&1 | head -n1
+}
+
+# Numeric build id out of the version string ("2.19-11315950" ->
+# "11315950"). Empty for non-numeric suffixes like "2.19-debian".
+aapt2_build_number() {
+    local ver build
+    ver="$(aapt2_version_string "$1" 2>/dev/null)" || return 0
+    build="$(echo "${ver}" | sed -n 's/.*2\.19-\([0-9]\{4,\}\).*/\1/p')"
+    echo "${build}"
+}
+
+# Capability probe: the binary must expose --source-path on `compile`.
+#
+# NOTE: `aapt2 compile --help` prints its usage but EXITs with status 1
+# (both Google's and ReVanced's builds do). Combined with the global
+# `set -o pipefail` this made the old `... | grep -q` pipeline fail for
+# EVERY binary — the root cause of issue #13. The output is therefore
+# captured with `|| true` and matched as a string.
+aapt2_supports_source_path() {
+    local bin="$1" help_output
+    [[ -x "${bin}" ]] || return 1
+    help_output="$("${bin}" compile --help 2>&1 || true)"
+    [[ "${help_output}" == *"--source-path"* ]]
+}
+
+# Functional compatibility probe (issue #13): some distro AAPT2 builds
+# (e.g. Ubuntu's, built from AOSP 14-beta) pass the --source-path check
+# but cannot parse the resource tables of modern SDK platforms — the
+# "RES_TABLE_TYPE_TYPE entry offsets overlap actual entry data" failure.
+# Prove real-world compatibility by linking a minimal manifest against
+# the NEWEST installed android.jar. Returns 0 (pass) when no platform is
+# installed to probe against.
+aapt2_can_link_platform() {
+    local bin="$1"
+    [[ -x "${bin}" ]] || return 1
+    local sdk="${SDK_ROOT:-${ANDROID_HOME:-${ANDROID_SDK_ROOT:-${HOME}/Android/Sdk}}}"
+    local best_api=-1 best_jar="" p n
+    for p in "${sdk}"/platforms/android-*/android.jar; do
+        [[ -f "${p}" ]] || continue
+        n="$(basename "$(dirname "${p}")")"   # e.g. android-37.0
+        n="${n#android-}"; n="${n%%.*}"
+        [[ "${n}" =~ ^[0-9]+$ ]] || continue
+        if (( n > best_api )); then best_api="${n}"; best_jar="${p}"; fi
+    done
+    if [[ -z "${best_jar}" ]]; then
+        debug "No SDK platform installed yet; skipping the AAPT2 platform-link probe."
+        return 0
+    fi
+    local probe_dir probe_rc
+    probe_dir="$(mktemp -d 2>/dev/null)" || return 0
+    cat > "${probe_dir}/AndroidManifest.xml" <<'MEOF'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.aapt2probe">
+</manifest>
+MEOF
+    "${bin}" link -o "${probe_dir}/probe.apk" -I "${best_jar}" \
+        --manifest "${probe_dir}/AndroidManifest.xml" >/dev/null 2>&1
+    probe_rc=$?
+    rm -rf "${probe_dir}"
+    if [[ ${probe_rc} -ne 0 ]]; then
+        info "AAPT2 '${bin}' cannot link against ${best_jar} (resource-table incompatibility)."
+    fi
+    return ${probe_rc}
+}
+
+# Minimum-version threshold evaluation (issue #13, requirement 1).
+# A binary meets the requirement when:
+#   1. it is executable and actually runs on this machine/architecture, and
+#   2. it supports the --source-path flag required by modern AGP, and
+#   3. its build id (when one is reported) is >= AAPT2_MIN_BUILD, and
+#   4. it can link against the newest installed SDK platform (when one
+#      exists) — this rejects distro AAPT2s that are too old for modern
+#      android.jar resource tables.
+aapt2_meets_minimum() {
+    local bin="$1" ver build
+    [[ -n "${bin}" && -x "${bin}" ]] || return 1
+    ver="$(aapt2_version_string "${bin}" 2>/dev/null)" || {
+        debug "'${bin}' produced no version output (not runnable on this machine?)"
+        return 1
+    }
+    if ! aapt2_supports_source_path "${bin}"; then
+        info "AAPT2 '${bin}' (${ver:-unknown version}) is below the minimum requirement: no --source-path support."
+        return 1
+    fi
+    build="$(aapt2_build_number "${bin}")"
+    if [[ -n "${build}" && "${AAPT2_MIN_BUILD}" -gt 0 && "${build}" -lt "${AAPT2_MIN_BUILD}" ]]; then
+        info "AAPT2 '${bin}' (build ${build}) is below the configured minimum build ${AAPT2_MIN_BUILD}."
+        return 1
+    fi
+    if ! aapt2_can_link_platform "${bin}"; then
+        return 1
+    fi
+    debug "'${bin}' meets the minimum requirement (${ver:-version unknown})."
+    return 0
+}
+
+# Evaluate every pre-existing AAPT2 candidate (SDK build-tools, PATH,
+# previously installed ReVanced binary, ...) against the minimum
+# requirement. Returns 0 and sets AAPT2_PATH/AAPT2_PROVENANCE when a
+# qualifying binary is found — BEFORE any external download happens.
+find_compatible_aapt2() {
+    local candidates=() c p
+    if [[ -n "${SDK_ROOT:-}" && -d "${SDK_ROOT}/build-tools" ]]; then
+        for c in "${SDK_ROOT}"/build-tools/*/aapt2; do
+            [[ -x "${c}" ]] && candidates+=("${c}")
+        done
+    fi
+    for p in "$(command -v aapt2 || true)" "$(command -v aapt || true)" \
+             /usr/local/bin/aapt2 "${HOME}/.local/bin/aapt2" "${PREFIX:-}/bin/aapt2"; do
+        [[ -n "${p}" && -x "${p}" ]] && candidates+=("${p}")
+    done
+    # de-duplicate while preserving order
+    local seen="" unique=()
+    for c in "${candidates[@]}"; do
+        [[ " ${seen} " == *" ${c} "* ]] && continue
+        seen="${seen} ${c}"
+        unique+=("${c}")
+    done
+    for c in "${unique[@]}"; do
+        if aapt2_meets_minimum "${c}"; then
+            AAPT2_PATH="${c}"
+            AAPT2_PROVENANCE="existing"
+            info "Existing AAPT2 at ${c} meets the minimum requirement; no download needed."
+            return 0
+        fi
+    done
+    debug "No pre-existing AAPT2 meets the minimum requirement (checked: ${seen:-none})."
+    return 1
+}
+
+# Last-resort fallback: pick any AAPT2 that at least runs, even if it is
+# below the minimum requirement, so that the script can still finish
+# with exit status 0 and configure Gradle (issue #13, requirement 3).
+find_best_effort_aapt2() {
+    local c
+    for c in "$(command -v aapt2 || true)" "$(command -v aapt || true)" \
+             /usr/local/bin/aapt2 "${HOME}/.local/bin/aapt2"; do
+        if [[ -n "${c}" && -x "${c}" ]] && aapt2_version_string "${c}" &>/dev/null; then
+            AAPT2_PATH="${c}"
+            AAPT2_PROVENANCE="fallback"
+            warn "Fallback AAPT2 (does NOT meet the --source-path requirement): ${c}"
+            return 0
+        fi
+    done
+    warn "No runnable AAPT2 binary found at all; skipping AAPT2-dependent configuration."
+    return 1
 }
 
 # ----------------------------------------------------------------------
@@ -410,6 +575,26 @@ install_system_aapt2() {
 # ----------------------------------------------------------------------
 # Install Android SDK (official Google)
 # ----------------------------------------------------------------------
+# Discover the newest stable platform package name (e.g.
+# "platforms;android-37.0") advertised by sdkmanager. Falls back to an
+# empty string so the caller can use its default. Only plain stable
+# releases are considered — beta/ext/preview variants are filtered out.
+resolve_newest_platform() {
+    local sdkmanager_bin="$1" listing raw name best="" best_num=-1 num
+    listing="$("${sdkmanager_bin}" --list 2>/dev/null || true)"
+    [[ -z "${listing}" ]] && return 0
+    while IFS= read -r raw; do
+        name="${raw#platforms;android-}"
+        [[ "${name}" == "${raw}" ]] && continue
+        [[ "${name}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || continue
+        num="${name%%.*}"
+        if (( num > best_num )); then best_num="${num}"; best="${name}"; fi
+    done < <(printf '%s\n' "${listing}" | \
+        sed -n 's/^[[:space:]]*platforms;android-\([0-9][0-9]*\(\.[0-9][0-9]*\)\{0,1\}\)[[:space:]].*/platforms;android-\1/p')
+    [[ -n "${best}" ]] && echo "platforms;android-${best}"
+    return 0
+}
+
 install_sdk() {
     info "Setting up Android SDK (official Google command line tools)..."
     local sdk_root="${SDK_ROOT:-${HOME}/Android/Sdk}"
@@ -445,16 +630,72 @@ install_sdk() {
     info "Installing platform-tools..."
     yes | "${sdkmanager_bin}" --sdk_root="${sdk_root}" "platform-tools" > /dev/null
 
-    info "Installing platform android-35 and build-tools 35.0.0..."
-    yes | "${sdkmanager_bin}" --sdk_root="${sdk_root}" "platforms;android-35" "build-tools;35.0.0" > /dev/null
+    # Install the newest stable platform available (issue #13): a modern
+    # android.jar on disk is required both for building current apps and
+    # for the AAPT2 minimum-requirement probe. Older platforms that a
+    # specific project needs are auto-downloaded by AGP (licenses are
+    # accepted above).
+    local platform_pkg
+    platform_pkg="$(resolve_newest_platform "${sdkmanager_bin}")"
+    [[ -z "${platform_pkg}" ]] && platform_pkg="platforms;android-37.0"
+    info "Installing ${platform_pkg} and build-tools 35.0.0..."
+    yes | "${sdkmanager_bin}" --sdk_root="${sdk_root}" "${platform_pkg}" "build-tools;35.0.0" > /dev/null
 
     SDK_ROOT="${sdk_root}"
     SDK_STATUS="VALID"
+
+    # Persist the SDK environment so that CI steps, fresh shells and
+    # non-login shells all find the SDK (fixes "SDK location not found"
+    # in downstream Gradle builds).
+    write_env_exports
     info "Android SDK setup complete."
 }
 
 # ----------------------------------------------------------------------
-# Download and install ReVanced AAPT2
+# Persist environment (env.sh + shell rc files)
+# ----------------------------------------------------------------------
+write_env_exports() {
+    local sdk_root="${SDK_ROOT:-${HOME}/Android/Sdk}"
+    mkdir -p "$(dirname "${ENV_FILE}")"
+
+    info "Writing environment file ${ENV_FILE} ..."
+    cat > "${ENV_FILE}" <<EOF
+# Auto-generated by ${TOOL_NAME} ${TOOL_VERSION}. Source this file to use
+# the Android build environment: . "${ENV_FILE}"
+export ANDROID_HOME="${sdk_root}"
+export ANDROID_SDK_ROOT="${sdk_root}"
+case ":\$PATH:" in
+    *":\$ANDROID_HOME/cmdline-tools/latest/bin:"*) ;;
+    *) export PATH="\$ANDROID_HOME/cmdline-tools/latest/bin:\$ANDROID_HOME/platform-tools:\$PATH" ;;
+esac
+if [ -z "\${JAVA_HOME:-}" ] && command -v java >/dev/null 2>&1; then
+    _java_bin="\$(command -v java)"
+    [ -L "\$_java_bin" ] 2>/dev/null && _java_bin="\$(readlink -f "\$_java_bin")"
+    export JAVA_HOME="\$(dirname "\$(dirname "\$_java_bin")")"
+    unset _java_bin
+fi
+EOF
+    if [[ -n "${AAPT2_PATH:-}" && -x "${AAPT2_PATH}" ]]; then
+        echo "export GRADLE_OPTS=\"-Dandroid.aapt2FromMavenOverride=${AAPT2_PATH}\"" >> "${ENV_FILE}"
+    fi
+
+    # Also export ANDROID_HOME in interactive shell rc files so that
+    # Gradle finds the SDK in new terminals on every distro and Termux.
+    for rc in "${HOME}/.bashrc" "${HOME}/.zshrc"; do
+        if [[ -f "${rc}" ]]; then
+            sed -i '/^export ANDROID_HOME=/d; /^export ANDROID_SDK_ROOT=/d' "${rc}"
+        fi
+        {
+            echo "export ANDROID_HOME=\"${sdk_root}\""
+            echo "export ANDROID_SDK_ROOT=\"${sdk_root}\""
+        } >> "${rc}"
+    done
+    export ANDROID_HOME="${sdk_root}"
+    export ANDROID_SDK_ROOT="${sdk_root}"
+}
+
+# ----------------------------------------------------------------------
+# Download and install ReVanced AAPT2 (robust, with graceful fallback)
 # ----------------------------------------------------------------------
 install_revanced_aapt2() {
     info "Downloading ReVanced ARM64 AAPT2 with redirect following..."
@@ -463,45 +704,64 @@ install_revanced_aapt2() {
         target_path="${HOME}/.local/bin/aapt2"
         mkdir -p "$(dirname "${target_path}")"
     fi
+    local tmp="${target_path}.tmp"
 
+    local downloaded=false
     if command -v curl &>/dev/null; then
-        if curl -sSL -L "${REVANCED_AAPT2_URL}" -o "${target_path}.tmp"; then
-            chmod +x "${target_path}.tmp"
-            if aapt2_supports_source_path "${target_path}.tmp"; then
-                mv "${target_path}.tmp" "${target_path}"
-                AAPT2_PATH="${target_path}"
-                info "ReVanced AAPT2 installed and validated at ${AAPT2_PATH}"
-                return 0
-            else
-                error "Downloaded ReVanced binary does not support --source-path."
-                rm -f "${target_path}.tmp"
-                return 1
-            fi
+        # -f: an HTTP error (404/403 rate-limit/proxy page) must FAIL the
+        # download instead of silently writing the error body to disk;
+        # retries tolerate transient network failures.
+        if curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors \
+                -o "${tmp}" "${REVANCED_AAPT2_URL}"; then
+            downloaded=true
         else
-            error "curl download failed."
-            return 1
+            error "curl download failed (HTTP error or network failure)."
         fi
     elif command -v wget &>/dev/null; then
-        if wget -q -O "${target_path}.tmp" "${REVANCED_AAPT2_URL}"; then
-            chmod +x "${target_path}.tmp"
-            if aapt2_supports_source_path "${target_path}.tmp"; then
-                mv "${target_path}.tmp" "${target_path}"
-                AAPT2_PATH="${target_path}"
-                info "ReVanced AAPT2 installed and validated at ${AAPT2_PATH}"
-                return 0
-            else
-                error "Downloaded ReVanced binary does not support --source-path."
-                rm -f "${target_path}.tmp"
-                return 1
-            fi
+        if wget -q --tries=3 -O "${tmp}" "${REVANCED_AAPT2_URL}"; then
+            downloaded=true
         else
             error "wget download failed."
-            return 1
         fi
     else
         error "Neither curl nor wget is available."
         return 1
     fi
+
+    if [[ "${downloaded}" != "true" ]]; then
+        rm -f "${tmp}"
+        return 1
+    fi
+
+    # Sanity: the file must be a reasonably sized ELF binary, not an HTML
+    # error page or a truncated response.
+    local size magic
+    size=$(stat -c%s "${tmp}" 2>/dev/null || echo 0)
+    magic=$(head -c 4 "${tmp}" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')
+    if [[ "${size}" -lt 1000000 || "${magic}" != "7f454c46" ]]; then
+        error "Downloaded file is not a valid AAPT2 ELF binary (size=${size} bytes, magic=${magic:-none})."
+        local first_bytes
+        first_bytes=$(head -c 120 "${tmp}" 2>/dev/null | tr -d '\0' | head -n1)
+        [[ -n "${first_bytes}" ]] && error "  downloaded content starts with: ${first_bytes}"
+        rm -f "${tmp}"
+        return 1
+    fi
+
+    chmod +x "${tmp}"
+
+    if aapt2_meets_minimum "${tmp}"; then
+        mv -f "${tmp}" "${target_path}"
+        AAPT2_PATH="${target_path}"
+        AAPT2_PROVENANCE="revanced"
+        info "ReVanced AAPT2 installed and validated at ${AAPT2_PATH}"
+        return 0
+    fi
+
+    # Keep diagnostics in the log before discarding the bad binary.
+    error "Downloaded ReVanced binary did not pass the minimum-requirement validation."
+    error "  validation output: $(${tmp} compile --help 2>&1 | head -n 3 | tr '\n' ' ')"
+    rm -f "${tmp}"
+    return 1
 }
 
 # ----------------------------------------------------------------------
@@ -509,7 +769,12 @@ install_revanced_aapt2() {
 # ----------------------------------------------------------------------
 configure_gradle_override() {
     local aapt2_bin="${AAPT2_PATH}"
-    [[ -z "${aapt2_bin}" || ! -x "${aapt2_bin}" ]] && { error "Invalid AAPT2 path."; return 1; }
+    if [[ -z "${aapt2_bin}" || ! -x "${aapt2_bin}" ]]; then
+        # Issue #13, requirement 3: never abort the script here — report,
+        # keep the exit status 0 and leave the machine unconfigured.
+        error "No usable AAPT2 path to configure; skipping Gradle override configuration."
+        return 0
+    fi
 
     info "Configuring Gradle AAPT2 override..."
 
@@ -525,21 +790,31 @@ configure_gradle_override() {
     local hook_dir="${HOME}/.gradle/init.d"
     local hook_file="${hook_dir}/aapt2_override.init.gradle.kts"
     mkdir -p "${hook_dir}"
-    cat > "${hook_file}" <<'EOF'
+    # The VERIFIED, installer-validated binary is baked in as the first
+    # choice (issue #13, requirement 4); SDK build-tools and PATH only
+    # serve as fallbacks if that binary was removed later. This also
+    # prevents Gradle from picking up an unusable SDK build-tools AAPT2
+    # (Google ships x86_64-only build-tools for Linux, which cannot run
+    # on ARM64 machines).
+    cat > "${hook_file}" <<EOF
 // Auto-generated by arm64-android-build-env
-// Prioritizes Android SDK build-tools AAPT2, then PATH.
+// Priority: (1) the AAPT2 binary verified by the installer, (2) newest
+// Android SDK build-tools AAPT2, (3) first aapt2 found on PATH.
 import java.io.File
 
-val sdkHome = System.getenv("ANDROID_HOME") ?: System.getenv("ANDROID_SDK_ROOT") ?: ""
-var chosenAapt2: File? = null
+val verifiedAapt2 = File("${aapt2_bin}")
+var chosenAapt2: File? = if (verifiedAapt2.exists() && verifiedAapt2.canExecute()) verifiedAapt2 else null
 
-if (sdkHome.isNotEmpty()) {
-    val buildToolsDir = File(sdkHome, "build-tools")
-    if (buildToolsDir.exists() && buildToolsDir.isDirectory) {
-        chosenAapt2 = buildToolsDir.listFiles()
-            ?.filter { it.isDirectory && File(it, "aapt2").canExecute() }
-            ?.maxByOrNull { it.name }
-            ?.let { File(it, "aapt2") }
+if (chosenAapt2 == null) {
+    val sdkHome = System.getenv("ANDROID_HOME") ?: System.getenv("ANDROID_SDK_ROOT") ?: ""
+    if (sdkHome.isNotEmpty()) {
+        val buildToolsDir = File(sdkHome, "build-tools")
+        if (buildToolsDir.exists() && buildToolsDir.isDirectory) {
+            chosenAapt2 = buildToolsDir.listFiles()
+                ?.filter { it.isDirectory && File(it, "aapt2").canExecute() }
+                ?.maxByOrNull { it.name }
+                ?.let { File(it, "aapt2") }
+        }
     }
 }
 
@@ -572,6 +847,9 @@ EOF
     ./gradlew --stop > /dev/null 2>&1 || true
     pkill -f gradle > /dev/null 2>&1 || true
 
+    # Refresh the environment file so CI steps also get GRADLE_OPTS
+    write_env_exports
+
     echo ""
     echo "=================================================="
     echo "AAPT2 OVERRIDE CONFIGURED:"
@@ -591,7 +869,13 @@ main() {
     echo "This script will set up the ARM64 Android build environment."
     echo "It will install required packages and configure Gradle."
     echo "=================================================="
-    read -p "Do you want to proceed with setup? [y/N]: " -r initial_confirm
+    read -p "Do you want to proceed with setup? [y/N]: " -r initial_confirm || initial_confirm=""
+    if [[ ! -t 0 && -z "${initial_confirm}" ]]; then
+        # Non-interactive context (CI, `curl | bash`, piped stdin): the
+        # recommended answer is applied automatically instead of aborting.
+        initial_confirm="y"
+        info "Non-interactive session detected; proceeding with setup automatically."
+    fi
     if [[ ! "${initial_confirm}" =~ ^[Yy]$ ]]; then
         info "Aborted by user."
         exit 0
@@ -648,45 +932,66 @@ main() {
         check_sdk
     fi
 
-    # Install system AAPT2 (always, to have a baseline).
-    # Some distros cannot provide a system AAPT2 package (e.g. Arch's
-    # android-tools ships adb/fastboot only, no aapt2/aapt). Do not abort in
-    # that case: continue so the ReVanced AAPT2 prompt below can offer the
-    # recommended fallback instead of the script dying before it.
-    if ! install_system_aapt2; then
-        warn "System AAPT2 could not be installed. Continuing to the ReVanced AAPT2 option (recommended)."
-    fi
-    check_aapt2
-
-    # Prompt for ReVanced AAPT2 based on OS type
-    if [[ "${OS_NAME}" == "termux" ]]; then
-        echo ""
-        read -p "Do you want to install ReVanced ARM64 AAPT2? [Y/n]: " -r use_revanced
-        use_revanced="${use_revanced:-Y}"
-        if [[ "${use_revanced}" =~ ^[Yy]$ ]]; then
-            install_revanced_aapt2 || {
-                error "Failed to install ReVanced AAPT2. Keeping system AAPT2."
-            }
-        fi
+    # ----------------------------------------------------------------
+    # AAPT2 provisioning (issue #13):
+    #  1. Evaluate the existing local/system AAPT2 against the minimum
+    #     version requirement BEFORE any external download.
+    #  2. Skip the ReVanced download entirely when a local binary already
+    #     qualifies (e.g. Termux's official aapt2 package).
+    #  3. Graceful fallback: a failed ReVanced fetch NEVER aborts the
+    #     script — fall back to the best available AAPT2, still finish
+    #     with exit status 0 and configure Gradle with what we have.
+    # ----------------------------------------------------------------
+    if find_compatible_aapt2; then
+        info "Local AAPT2 already satisfies the minimum version requirement; skipping all external AAPT2 downloads."
     else
-        echo ""
-        echo "============================================================"
-        echo "WARNING: System official repository's AAPT2 on Debian/Ubuntu/Kali/Arch is outdated and lacks '--source-path' support required by modern AGP."
-        echo "RECOMMENDED: ReVanced Team provides an open-source, up-to-date ARM64 AAPT2 binary."
-        echo "============================================================"
-        echo ""
-        read -p "Do you want to download and install ReVanced ARM64 AAPT2? [Y/n]: " -r use_revanced
-        use_revanced="${use_revanced:-Y}"
-        if [[ "${use_revanced}" =~ ^[Yy]$ ]]; then
-            install_revanced_aapt2 || {
-                error "Failed to install ReVanced AAPT2. Keeping system AAPT2."
-            }
+        # Install system AAPT2 as a baseline.
+        # Some distros cannot provide a system AAPT2 package (e.g. Arch's
+        # android-tools ships adb/fastboot only, no aapt2/aapt). Do not
+        # abort in that case: continue to the ReVanced AAPT2 option.
+        if ! install_system_aapt2; then
+            warn "System AAPT2 could not be installed. Continuing to the ReVanced AAPT2 option (recommended)."
+        fi
+
+        if find_compatible_aapt2; then
+            info "System AAPT2 now satisfies the minimum version requirement; skipping ReVanced download."
         else
-            warn "Keeping system AAPT2. Build may fail due to missing --source-path."
+            if [[ "${OS_NAME}" == "termux" ]]; then
+                echo ""
+                read -p "Do you want to install ReVanced ARM64 AAPT2? [Y/n]: " -r use_revanced || use_revanced=""
+            else
+                echo ""
+                echo "============================================================"
+                echo "WARNING: System official repository's AAPT2 on Debian/Ubuntu/Kali/Arch is outdated and lacks '--source-path' support required by modern AGP."
+                echo "RECOMMENDED: ReVanced Team provides an open-source, up-to-date ARM64 AAPT2 binary."
+                echo "============================================================"
+                echo ""
+                read -p "Do you want to download and install ReVanced ARM64 AAPT2? [Y/n]: " -r use_revanced || use_revanced=""
+            fi
+            if [[ ! -t 0 && -z "${use_revanced}" ]]; then
+                # Non-interactive (CI / piped stdin): take the recommended choice.
+                use_revanced="Y"
+                info "Non-interactive session detected; using the recommended ReVanced AAPT2."
+            fi
+            use_revanced="${use_revanced:-Y}"
+            if [[ "${use_revanced}" =~ ^[Yy]$ ]]; then
+                if ! install_revanced_aapt2; then
+                    # Requirement 3: graceful fallback, keep exit status 0.
+                    warn "ReVanced AAPT2 could not be installed; falling back to the best available AAPT2."
+                fi
+            else
+                warn "Keeping system AAPT2. Build may fail due to missing --source-path."
+            fi
         fi
     fi
 
-    # Configure Gradle override with final AAPT2 path
+    # If nothing qualified so far, make sure AAPT2_PATH points at the best
+    # runnable binary (below-threshold is still better than nothing).
+    if [[ -z "${AAPT2_PATH}" || ! -x "${AAPT2_PATH}" ]]; then
+        find_best_effort_aapt2 || true
+    fi
+
+    # Configure Gradle override with the final verified AAPT2 path
     configure_gradle_override
 
     # Final status
@@ -707,7 +1012,8 @@ main() {
     echo "Java                : ${JAVA_STATUS} - ${JAVA_INFO}"
     echo "Android SDK         : ${SDK_STATUS} - ${SDK_INFO}"
     echo "AAPT2               : ${AAPT2_STATUS} - ${AAPT2_INFO}"
-    echo "AAPT2 Path          : ${AAPT2_PATH:-N/A}"
+    echo "AAPT2 Path          : ${AAPT2_PATH:-N/A} (${AAPT2_PROVENANCE:-n/a})"
+    echo "Environment file    : ${ENV_FILE}"
     echo "================================================"
     if [[ "${JAVA_STATUS}" == "VALID" && "${SDK_STATUS}" == "VALID" && "${AAPT2_STATUS}" == "VALID" ]]; then
         info "Environment is ready for ARM64 Android builds."
