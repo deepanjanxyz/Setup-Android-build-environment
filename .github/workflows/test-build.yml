@@ -25,29 +25,50 @@ jobs:
       - name: Make Script Executable & Run Setup (Non-Interactive)
         run: |
           chmod +x Install.sh
-          # Functional Fix: Pass auto-confirmation 'y' to prevent silent skip
-          echo "y" | ./Install.sh
+          # Non-interactive (no TTY): the script auto-accepts the
+          # recommended answers, so no piped "y" is needed anymore.
+          ./Install.sh < /dev/null
 
       - name: Verify Environment
         run: |
+          ENV_FILE="$HOME/.local/share/arm64-android-build-env/env.sh"
           echo "Architecture Check:"
           uname -m
           echo "Java Version:"
           java -version
+          # Import the environment configured by Install.sh
+          if [ -f "$ENV_FILE" ]; then . "$ENV_FILE"; fi
+          echo "ANDROID_HOME: ${ANDROID_HOME:-<not set>}"
+          echo "JAVA_HOME: ${JAVA_HOME:-<not set>}"
+          echo "GRADLE_OPTS: ${GRADLE_OPTS:-<not set>}"
 
       - name: Clone & Build Target App
         # Security Fix 3: Pass inputs via env variable to prevent shell injection
         env:
-          TEST_REPO_URL: ${{ github.event.inputs.test_repo_url }}
+          TEST_REPO_URL: ${{ github.event.inputs.test_repo_url || 'https://github.com/deepanjanxyz/notepad.git' }}
         run: |
+          # Import the SDK / Java / AAPT2 environment configured by Install.sh.
+          # Each GitHub Actions step is a fresh, non-login shell, so the
+          # exports written to shell rc files are NOT inherited automatically.
+          ENV_FILE="$HOME/.local/share/arm64-android-build-env/env.sh"
+          if [ -f "$ENV_FILE" ]; then
+            . "$ENV_FILE"
+          else
+            # Fallback for older script versions without an env file.
+            export ANDROID_HOME="$HOME/Android/Sdk"
+            export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          fi
           git clone -- "$TEST_REPO_URL" test-project
           cd test-project
+          # Belt-and-braces: also tell Gradle where the SDK lives via
+          # local.properties (only the freshly cloned test project is touched).
+          echo "sdk.dir=${ANDROID_HOME}" > local.properties
           chmod +x gradlew
-          ./gradlew assembleDebug --stacktrace
+          ./gradlew assembleDebug --stacktrace --no-daemon
 
       - name: Upload Built APK
         uses: actions/upload-artifact@v7
         with:
           name: built-apk
           path: test-project/app/build/outputs/apk/debug/*.apk
-          
+          if-no-files-found: warn
