@@ -10,7 +10,7 @@ on:
 
 jobs:
   test-setup-and-build:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-26.04-arm
     # Security Fix 1: Restrict job token permissions to read-only
     permissions:
       contents: read
