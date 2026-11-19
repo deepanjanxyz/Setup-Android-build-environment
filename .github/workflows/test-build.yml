@@ -1,12 +1,19 @@
 name: Test ARM64 Build Environment Setup
 
 on:
+  # Every pull request gets the real ARM64 install + APK build, so a change
+  # to Install.sh cannot be merged on the stubbed tests alone.
+  pull_request:
   workflow_dispatch:
     inputs:
       test_repo_url:
         description: 'Target Android Project Git URL'
         required: false
         default: 'https://github.com/deepanjanxyz/notepad.git'
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test-setup-and-build:

@@ -112,6 +112,27 @@ AGP.
 
 ---
 
+## ⚙️ Installer Options
+
+    ./Install.sh [--check] [--verbose] [--yes] [--strict] [--version]
+
+| Option | What it does |
+| :--- | :--- |
+| `--check` | Only detect and report (Java, SDK, AAPT2) — makes no changes. |
+| `--verbose` | Show debug-level output on the terminal as well. |
+| `--yes` | Answer "yes" to every question (fully non-interactive). |
+| `--strict` | Exit with status `1` when the environment is not fully ready (default is `0`, so CI is never broken by an AAPT2 fallback). |
+| `--version` | Print the installer version and exit. |
+
+Every run writes a log to `~/.local/share/arm64-android-build-env/logs/` and a
+machine-readable summary to `~/.local/share/arm64-android-build-env/state.json`
+(OS, architecture, `JAVA_HOME`, SDK root, chosen AAPT2 and where it came from).
+Re-running is safe and idempotent: the managed lines in `~/.bashrc` / `~/.zshrc`
+are replaced, never duplicated, and an existing `GRADLE_OPTS` value is extended
+rather than overwritten.
+
+---
+
 ## 🌍 Reusing the Environment (CI, scripts, Termux)
 
 The installer writes a portable environment file at:
