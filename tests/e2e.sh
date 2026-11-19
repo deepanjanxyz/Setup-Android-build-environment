@@ -21,6 +21,9 @@ printf '#!/bin/sh\n[ "$1" = "-m" ] && echo aarch64 || /usr/bin/uname "$@"\n' > "
 printf '#!/bin/sh\nexit 0\n' > "${T}/apt-get"        # pretend package installs succeed
 printf '#!/bin/sh\nexit 22\n' > "${T}/curl"          # simulate "network refused"
 printf '#!/bin/sh\necho "openjdk version \\"17.0.11\\" 2024-04-16" >&2\n' > "${T}/java"
+# sudo stub: drop -n/-E and exec the rest, so `sudo -n apt-get ...` reaches
+# the stub apt-get instead of the runner's real, passwordless sudo.
+printf '#!/bin/sh\nwhile [ "$1" = "-n" ] || [ "$1" = "-E" ]; do shift; done\nexec "$@"\n' > "${T}/sudo"
 cat > "${T}/aapt2" <<'EOF'
 #!/bin/sh
 case "$1" in
@@ -29,13 +32,13 @@ case "$1" in
   link) exit 0;;
 esac
 EOF
-chmod +x "${T}/uname" "${T}/apt-get" "${T}/curl" "${T}/java" "${T}/aapt2"
+chmod +x "${T}/uname" "${T}/apt-get" "${T}/curl" "${T}/java" "${T}/aapt2" "${T}/sudo"
 
 # A sandboxed machine: stub bin dir first on PATH, throwaway HOME.
 mk_machine() { # $1 = name, $2 = "with-sdk" | "bare"
     local dir="${T}/$1"
     mkdir -p "${dir}/bin" "${dir}/home"
-    cp "${T}/uname" "${T}/apt-get" "${T}/curl" "${T}/java" "${dir}/bin/"
+    cp "${T}/uname" "${T}/apt-get" "${T}/curl" "${T}/java" "${T}/sudo" "${dir}/bin/"
     if [[ "$2" == "with-sdk" ]]; then
         mkdir -p "${dir}/home/Android/Sdk/platform-tools" \
                  "${dir}/home/Android/Sdk/cmdline-tools/latest/bin"
@@ -44,9 +47,15 @@ mk_machine() { # $1 = name, $2 = "with-sdk" | "bare"
     echo "${dir}"
 }
 
+clean_env() { # run a command with a hermetic environment
+    env -u ANDROID_HOME -u ANDROID_SDK_ROOT -u ANDROID_USER_HOME \
+        -u JAVA_HOME -u GRADLE_OPTS -u GRADLE_USER_HOME -u PREFIX \
+        "$@"
+}
+
 run_in() { # $1 = machine dir, rest = script args
     local dir="$1"; shift
-    HOME="${dir}/home" PATH="${dir}/bin:/usr/bin:/bin" "${INSTALL}" "$@" < /dev/null 2>&1
+    clean_env HOME="${dir}/home" PATH="${dir}/bin:/usr/bin:/bin" "${INSTALL}" "$@" < /dev/null 2>&1
 }
 
 echo "=== A: fully provisioned machine, non-interactive ==="
@@ -98,7 +107,7 @@ echo
 echo "=== D: a non-ARM64 machine is refused ==="
 D="${T}/d"; mkdir -p "${D}/bin" "${D}/home"
 printf '#!/bin/sh\necho x86_64\n' > "${D}/bin/uname"; chmod +x "${D}/bin/uname"
-outd="$(HOME="${D}/home" PATH="${D}/bin:/usr/bin:/bin" "${INSTALL}" < /dev/null 2>&1)"; rcd=$?
+outd="$(clean_env HOME="${D}/home" PATH="${D}/bin:/usr/bin:/bin" "${INSTALL}" < /dev/null 2>&1)"; rcd=$?
 [[ ${rcd} -eq 1 ]] && ok "D refuses x86_64 (exit 1)" || bad "D arch refusal" "rc=${rcd}"
 grep -q 'only supports ARM64' <<<"${outd}" && ok "D explains why" || bad "D message" "missing"
 
