@@ -9,9 +9,12 @@
 # Configures Gradle overrides. Never touches project source code.
 #
 # Usage:
-#   ./install.sh [--check] [--verbose]
+#   ./Install.sh [--check] [--verbose] [--yes] [--strict] [--version]
 #   --check    Only check and report, no changes.
 #   --verbose  Show detailed logs.
+#   --yes      Assume "yes" for every prompt (non-interactive).
+#   --strict   Exit non-zero when the environment is not fully ready.
+#   --version  Print the script version and exit.
 
 set -o pipefail
 
@@ -19,7 +22,7 @@ set -o pipefail
 # Configuration
 # ----------------------------------------------------------------------
 TOOL_NAME="arm64-android-build-env"
-TOOL_VERSION="24.2.0"
+TOOL_VERSION="25.0.0"
 STATE_DIR="${HOME}/.local/share/${TOOL_NAME}"
 STATE_FILE="${STATE_DIR}/state.json"
 LOG_DIR="${STATE_DIR}/logs"
@@ -28,12 +31,16 @@ LOG_FILE="${LOG_DIR}/install-$(date +%Y-%m-%d).log"
 # ANDROID_HOME, ANDROID_SDK_ROOT, JAVA_HOME, PATH and GRADLE_OPTS.
 ENV_FILE="${STATE_DIR}/env.sh"
 
-# Java packages (target OpenJDK 21)
-JAVA_PKG_TERMUX="openjdk-21"
-JAVA_PKG_DEBIAN="openjdk-21-jdk"
-JAVA_PKG_ARCH="jdk-openjdk"          # Arch rolling, usually 21+
-JAVA_PKG_FEDORA="java-21-openjdk"
-JAVA_PKG_ALPINE="openjdk21"
+# Java packages (target OpenJDK 21, falling back to 17 which is the
+# minimum supported by current AGP). Each list is tried in order and the
+# first package that installs wins; JDK packages are preferred over JRE
+# ones because some builds need `javac`.
+JAVA_PKGS_TERMUX=("openjdk-21" "openjdk-17")
+JAVA_PKGS_DEBIAN=("openjdk-21-jdk" "openjdk-17-jdk" "default-jdk")
+JAVA_PKGS_ARCH=("jdk-openjdk" "jdk21-openjdk" "jdk17-openjdk")
+JAVA_PKGS_FEDORA=("java-21-openjdk-devel" "java-21-openjdk" "java-17-openjdk-devel")
+JAVA_PKGS_ALPINE=("openjdk21" "openjdk17")
+JAVA_MIN_MAJOR=17
 
 # AAPT2 packages
 AAPT2_PKG_TERMUX="aapt2"
@@ -63,45 +70,172 @@ AAPT2_MIN_BUILD=0
 # ----------------------------------------------------------------------
 # Logging & Args
 # ----------------------------------------------------------------------
-mkdir -p "${LOG_DIR}" 2>/dev/null
-exec 2>>"${LOG_FILE}"
+# NOTE: stderr is deliberately NOT redirected globally any more. `read -p`
+# writes its prompt to STDERR, so the old `exec 2>>"${LOG_FILE}"` made every
+# interactive question invisible and left the script looking hung. Command
+# output is logged explicitly by run_visible()/run_quietly() instead.
+if ! mkdir -p "${LOG_DIR}" 2>/dev/null || ! : >> "${LOG_FILE}" 2>/dev/null; then
+    LOG_DIR="${TMPDIR:-/tmp}/${TOOL_NAME}"
+    LOG_FILE="${LOG_DIR}/install-$(date +%Y-%m-%d).log"
+    mkdir -p "${LOG_DIR}" 2>/dev/null || LOG_FILE="/dev/null"
+fi
 
 VERBOSE=false
 CHECK_ONLY=false
+ASSUME_YES=false
+STRICT=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --check)   CHECK_ONLY=true ;;
         --verbose) VERBOSE=true ;;
-        --help)    cat <<EOF
-Usage: $0 [--check] [--verbose]
+        -y|--yes)  ASSUME_YES=true ;;
+        --strict)  STRICT=true ;;
+        --version) echo "${TOOL_NAME} ${TOOL_VERSION}"; exit 0 ;;
+        --help|-h) cat <<EOF
+Usage: $0 [--check] [--verbose] [--yes] [--strict] [--version]
   --check    Only check and report, no changes.
   --verbose  Show detailed output.
+  --yes      Assume "yes" for every prompt (non-interactive).
+  --strict   Exit non-zero when the environment is not fully ready.
+  --version  Print the script version and exit.
 EOF
             exit 0 ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
+        *) echo "Unknown option: $1 (try --help)" >&2; exit 1 ;;
     esac
     shift
 done
 
+# True only when stdin is a terminal and --yes was not given. Every
+# prompt goes through ask_yes_no(), which uses the default answer when
+# the script runs non-interactively (CI, `curl | bash`, </dev/null).
+INTERACTIVE=false
+if [[ "${ASSUME_YES}" != "true" && -t 0 ]]; then INTERACTIVE=true; fi
+
 log() {
     local level="$1"; shift
     local msg="$*"
-    local ts="$(date '+%Y-%m-%d %H:%M:%S')"
-    echo "[${ts}] [${level}] ${msg}" >> "${LOG_FILE}"
+    local ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    printf '[%s] [%s] %s\n' "${ts}" "${level}" "${msg}" >> "${LOG_FILE}" 2>/dev/null
     if [[ "${VERBOSE}" == "true" || "${level}" != "DEBUG" ]]; then
-        case "${level}" in
-            ERROR)   echo -e "\e[31m[ERROR]\e[0m ${msg}" ;;
-            WARNING) echo -e "\e[33m[WARNING]\e[0m ${msg}" ;;
-            INFO)    echo -e "\e[32m[INFO]\e[0m ${msg}" ;;
-            DEBUG)   echo -e "\e[90m[DEBUG]\e[0m ${msg}" ;;
-            *)       echo "${msg}" ;;
-        esac
+        # Colour only on a terminal, so piped/CI output stays readable.
+        if [[ -t 1 ]]; then
+            case "${level}" in
+                ERROR)   printf '\033[31m[ERROR]\033[0m %s\n' "${msg}" ;;
+                WARNING) printf '\033[33m[WARNING]\033[0m %s\n' "${msg}" ;;
+                INFO)    printf '\033[32m[INFO]\033[0m %s\n' "${msg}" ;;
+                DEBUG)   printf '\033[90m[DEBUG]\033[0m %s\n' "${msg}" ;;
+                *)       printf '%s\n' "${msg}" ;;
+            esac
+        else
+            case "${level}" in
+                ERROR|WARNING|INFO|DEBUG) printf '[%s] %s\n' "${level}" "${msg}" ;;
+                *)                        printf '%s\n' "${msg}" ;;
+            esac
+        fi
     fi
 }
 info()  { log "INFO" "$@"; }
 warn()  { log "WARNING" "$@"; }
 error() { log "ERROR" "$@"; }
 debug() { log "DEBUG" "$@"; }
+
+# ----------------------------------------------------------------------
+# Small helpers
+# ----------------------------------------------------------------------
+# Temp paths registered here are removed when the script exits.
+TMP_PATHS=()
+cleanup() {
+    local p
+    for p in "${TMP_PATHS[@]:-}"; do
+        [[ -n "${p}" && -e "${p}" ]] && rm -rf "${p}"
+    done
+}
+trap cleanup EXIT INT TERM
+
+# Run a command showing its output on the terminal AND appending it to the
+# log file. Returns the command's own exit status (not tee's).
+run_visible() {
+    "$@" 2>&1 | tee -a "${LOG_FILE}"
+    return "${PIPESTATUS[0]}"
+}
+
+# Run a command logging its output only (silent unless --verbose).
+run_quietly() {
+    if [[ "${VERBOSE}" == "true" ]]; then
+        run_visible "$@"
+    else
+        "$@" >> "${LOG_FILE}" 2>&1
+    fi
+}
+
+# Run a pipeline in which a feeder such as `yes` gets SIGPIPE (exit 141)
+# as soon as the consumer stops reading. Under `set -o pipefail` that 141
+# would be reported as a failure of the whole pipeline, so pipefail is
+# disabled for the duration and the status of the LAST command is used.
+run_pipeline() {
+    local had_pipefail=0 rc=0
+    [[ -o pipefail ]] && had_pipefail=1
+    set +o pipefail
+    "$@"
+    rc=$?
+    [[ ${had_pipefail} -eq 1 ]] && set -o pipefail
+    return ${rc}
+}
+
+# Ask a yes/no question without ever blocking a non-interactive run.
+#   $1  question text (already containing the [y/N] hint)
+#   $2  answer used when a human just presses Enter (default: Y)
+#   $3  answer used for CI / `curl | bash` / </dev/null (default: Y)
+# --yes answers everything with yes.
+# Usage: ask_yes_no "Question? [y/N]:" N Y
+ask_yes_no() {
+    local prompt="$1" default="${2:-Y}" auto="${3:-Y}" answer=""
+    if [[ "${ASSUME_YES}" == "true" ]]; then
+        debug "--yes given: answering 'yes' to '${prompt}'"
+        return 0
+    fi
+    if [[ "${INTERACTIVE}" != "true" ]]; then
+        debug "Non-interactive run: answering '${auto}' to '${prompt}'"
+        [[ "${auto}" =~ ^[Yy] ]]
+        return $?
+    fi
+    read -r -p "${prompt} " answer || answer=""
+    answer="${answer:-${default}}"
+    [[ "${answer}" =~ ^[Yy] ]]
+}
+
+# Append a line to a shell rc file, creating the file only when allowed
+# and keeping the file newline-terminated so the last line is not glued
+# onto the appended one.
+rc_set_line() {
+    local rc="$1" line="$2" create="${3:-yes}"
+    if [[ ! -f "${rc}" ]]; then
+        [[ "${create}" == "yes" ]] || return 0
+        : > "${rc}" || return 0
+    fi
+    if [[ -s "${rc}" && -n "$(tail -c 1 "${rc}")" ]]; then
+        printf '\n' >> "${rc}"
+    fi
+    grep -qxF -- "${line}" "${rc}" && return 0
+    printf '%s\n' "${line}" >> "${rc}"
+}
+
+# Remove the export lines this tool previously wrote to an rc file, so a
+# re-run updates them instead of stacking duplicates. Lines the user
+# wrote themselves (e.g. a plain GRADLE_OPTS=-Xmx2g) are left alone.
+rc_drop_managed() {
+    local rc="$1"
+    [[ -f "${rc}" ]] || return 0
+    sed -i \
+        -e '/^# arm64-android-build-env/d' \
+        -e '/^export JAVA_HOME=/d' \
+        -e '/^export ANDROID_HOME=/d' \
+        -e '/^export ANDROID_SDK_ROOT=/d' \
+        -e '/^export GRADLE_OPTS=.*aapt2FromMavenOverride=/d' \
+        -e '/^GRADLE_OPTS=.*aapt2FromMavenOverride=/d' \
+        "${rc}" 2>/dev/null || warn "Could not clean ${rc}"
+}
 
 # ----------------------------------------------------------------------
 # OS / Package Manager Detection
@@ -119,8 +253,10 @@ detect_os() {
     if [[ ${EUID} -eq 0 ]]; then
         info "Running as root; package commands will be executed directly."
     elif command -v sudo &>/dev/null; then
-        SUDO="sudo"
-        info "Running as non-root; sudo will be used for package installation."
+        # `sudo -n` in non-interactive runs: fail fast with a clear error
+        # instead of blocking forever on a password prompt in CI.
+        if [[ "${INTERACTIVE}" == "true" ]]; then SUDO="sudo"; else SUDO="sudo -n"; fi
+        info "Running as non-root; '${SUDO}' will be used for package installation."
     else
         warn "Running as non-root and sudo is not available; package installation may fail."
     fi
@@ -185,121 +321,143 @@ run_cmd() {
 
 run_update() {
     info "Running system update..."
-    [[ -n "${UPDATE_CMD}" ]] && run_cmd bash -c "${UPDATE_CMD}"
+    [[ -n "${UPDATE_CMD}" ]] || return 0
+    # A failing mirror must not abort the whole installation.
+    run_visible bash -c "${UPDATE_CMD}" || warn "System update reported an error; continuing."
+    return 0
 }
 
 install_pkg() {
     local pkg="$1"
     info "Installing ${pkg} via ${PKG_MANAGER}..."
-    run_cmd ${INSTALL_CMD} "${pkg}"
+    # ${INSTALL_CMD} is intentionally unquoted: it carries the command,
+    # its flags and the optional sudo prefix.
+    # shellcheck disable=SC2086
+    run_visible ${INSTALL_CMD} "${pkg}"
 }
 
 # ----------------------------------------------------------------------
 # Java version check (returns major version number, 0 if not found)
 # ----------------------------------------------------------------------
+# First line of `java -version` (which prints to stderr). Done without a
+# pipe so that `set -o pipefail` cannot turn a SIGPIPE on `head` into a
+# false failure.
+java_version_line() {
+    local bin="$1" out=""
+    [[ -n "${bin}" && -x "${bin}" ]] || return 0
+    out="$("${bin}" -version 2>&1 || true)"
+    printf '%s\n' "${out%%$'\n'*}"
+}
+
 get_java_major() {
-    local java_bin="$1"
+    local java_bin="$1" out=""
     if [[ -z "${java_bin}" || ! -x "${java_bin}" ]]; then
         echo "0"
         return
     fi
-    local version_output
-    version_output="$( "${java_bin}" -version 2>&1 | head -n 1 )"
-    local major=""
-    major=$(echo "${version_output}" | sed -n 's/.*version "\([0-9]*\)\..*/\1/p')
-    if [[ -z "${major}" ]]; then
-        major=$(echo "${version_output}" | sed -n 's/.*version "1\.\([0-9]*\)\..*/\1/p')
+    out="$(java_version_line "${java_bin}")"
+    # "openjdk version \"21.0.4\" 2024-07-16" -> 21
+    # "java version \"1.8.0_402\""          -> 8  (legacy 1.x scheme)
+    # The quotes are optional so that unquoted/garbled-but-numeric output
+    # from vendor JDK builds still parses.
+    if [[ "${out}" =~ [Vv]ersion\ \"?1\.([0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    elif [[ "${out}" =~ [Vv]ersion\ \"?([0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    else
+        echo "0"
     fi
-    if [[ -z "${major}" || ! "${major}" =~ ^[0-9]+$ ]]; then
-        major="0"
-    fi
-    echo "${major}"
 }
 
 # ----------------------------------------------------------------------
 # Java installation and configuration
 # ----------------------------------------------------------------------
 install_java() {
-    info "Installing Java (target OpenJDK 21)..."
+    info "Installing Java (target OpenJDK 21, minimum ${JAVA_MIN_MAJOR})..."
+    local pkgs=() p installed=false
     case "${OS_NAME}" in
-        termux)
-            install_pkg "${JAVA_PKG_TERMUX}"
-            ;;
-        debian)
-            install_pkg "${JAVA_PKG_DEBIAN}"
-            ;;
-        arch)
-            install_pkg "${JAVA_PKG_ARCH}"
-            ;;
-        fedora)
-            install_pkg "${JAVA_PKG_FEDORA}"
-            ;;
-        alpine)
-            install_pkg "${JAVA_PKG_ALPINE}"
-            ;;
+        termux) pkgs=("${JAVA_PKGS_TERMUX[@]}") ;;
+        debian) pkgs=("${JAVA_PKGS_DEBIAN[@]}") ;;
+        arch)   pkgs=("${JAVA_PKGS_ARCH[@]}") ;;
+        fedora) pkgs=("${JAVA_PKGS_FEDORA[@]}") ;;
+        alpine) pkgs=("${JAVA_PKGS_ALPINE[@]}") ;;
         *) error "No Java package defined for ${OS_NAME}"; return 1 ;;
     esac
 
+    # Try each candidate: OpenJDK 21 is not packaged on every release
+    # (e.g. Debian 12 bookworm ships 17), so a single hard-coded package
+    # name used to fail the whole setup there.
+    for p in "${pkgs[@]}"; do
+        if install_pkg "${p}"; then
+            installed=true
+            break
+        fi
+        warn "Package '${p}' could not be installed; trying the next candidate."
+    done
+    if [[ "${installed}" != "true" ]]; then
+        error "Could not install any JDK package (tried: ${pkgs[*]})."
+        return 1
+    fi
+
     # After installation, find Java binary and determine its major version
-    local java_bin
+    local java_bin major
     java_bin="$(command -v java || true)"
     if [[ -z "${java_bin}" ]]; then
         error "Java installation failed: java not found in PATH."
         return 1
     fi
-    local major
-    major=$(get_java_major "${java_bin}")
-    if [[ ${major} -lt 17 ]]; then
-        error "Installed Java version ${major} is still less than 17. Please install JDK 21 manually."
+    major="$(get_java_major "${java_bin}")"
+    if [[ ${major} -lt ${JAVA_MIN_MAJOR} ]]; then
+        error "Installed Java major version ${major} is below the required ${JAVA_MIN_MAJOR}. Please install JDK 21 manually."
         return 1
     fi
 
-    # Set Java 21 as default if multiple versions exist (Linux only)
-    if [[ "${OS_NAME}" != "termux" && -x "/usr/sbin/update-alternatives" ]]; then
-        local jdk21_bin=""
-        local jdk21_javac=""
-        for dir in /usr/lib/jvm/*21*; do
-            if [[ -x "${dir}/bin/java" ]]; then
-                jdk21_bin="${dir}/bin/java"
-                jdk21_javac="${dir}/bin/javac"
-                break
-            fi
+    # Select the newest JDK when alternatives are available (Linux only)
+    if [[ "${OS_NAME}" != "termux" ]] && command -v update-alternatives &>/dev/null; then
+        local jdk_dir="" d
+        for d in /usr/lib/jvm/*21* /usr/lib/jvm/*17*; do
+            if [[ -x "${d}/bin/java" ]]; then jdk_dir="${d}"; break; fi
         done
-        if [[ -n "${jdk21_bin}" ]]; then
-            info "Setting Java 21 as default via update-alternatives..."
-            ${SUDO} update-alternatives --set java "${jdk21_bin}" || warn "update-alternatives failed, but continuing."
-            if [[ -x "${jdk21_javac}" ]]; then
-                ${SUDO} update-alternatives --set javac "${jdk21_javac}" || warn "Failed to set javac alternative."
+        if [[ -n "${jdk_dir}" ]]; then
+            info "Selecting ${jdk_dir} as the default JDK..."
+            # --install registers the alternative when the distro never did;
+            # a bare --set fails with "no alternatives for java" otherwise.
+            run_quietly ${SUDO} update-alternatives --install /usr/bin/java java \
+                "${jdk_dir}/bin/java" 2100 || warn "Could not register java with update-alternatives."
+            if [[ -x "${jdk_dir}/bin/javac" ]]; then
+                run_quietly ${SUDO} update-alternatives --install /usr/bin/javac javac \
+                    "${jdk_dir}/bin/javac" 2100 || warn "Could not register javac with update-alternatives."
             else
-                warn "javac not found in JDK 21 directory; skipping javac alternative."
+                warn "javac not found in ${jdk_dir}; skipping javac alternative."
             fi
+            run_quietly ${SUDO} update-alternatives --set java "${jdk_dir}/bin/java" || \
+                warn "Could not set the java alternative; continuing."
         else
-            warn "Could not locate JDK 21 directory for alternatives."
+            warn "Could not locate a JDK directory for update-alternatives."
         fi
     fi
 
     # Export JAVA_HOME
-    local java_home=""
+    local java_home="" rc
     if [[ -x "${java_bin}" ]]; then
         java_home="$(dirname "$(dirname "$(readlink -f "${java_bin}")")")"
     fi
     if [[ -z "${java_home}" || ! -d "${java_home}" ]]; then
         warn "Could not determine JAVA_HOME automatically. You may need to set it manually."
     else
-        info "Setting JAVA_HOME=${java_home} in shell rc files and current session."
+        info "Setting JAVA_HOME=${java_home} for this session and in shell rc files."
         for rc in "${HOME}/.bashrc" "${HOME}/.zshrc"; do
-            if [[ -f "${rc}" ]]; then
-                sed -i '/^export JAVA_HOME=/d' "${rc}"
-                echo "export JAVA_HOME=\"${java_home}\"" >> "${rc}"
-            else
-                echo "export JAVA_HOME=\"${java_home}\"" > "${rc}"
-            fi
+            # Never create a ~/.zshrc for users who do not use zsh.
+            [[ "${rc}" == "${HOME}/.zshrc" && ! -f "${rc}" ]] && continue
+            sed -i '/^export JAVA_HOME=/d' "${rc}" 2>/dev/null
+            rc_set_line "${rc}" "# arm64-android-build-env (managed block)"
+            rc_set_line "${rc}" "export JAVA_HOME=\"${java_home}\""
         done
         export JAVA_HOME="${java_home}"
     fi
 
     JAVA_STATUS="VALID"
-    JAVA_INFO="$( ${java_bin} -version 2>&1 | head -n 1 )"
+    JAVA_INFO="$(java_version_line "${java_bin}")"
 }
 
 # ----------------------------------------------------------------------
@@ -311,12 +469,12 @@ check_java() {
         java_bin="$(command -v java)"
         local major
         major=$(get_java_major "${java_bin}")
-        if [[ ${major} -ge 17 ]]; then
+        if [[ ${major} -ge ${JAVA_MIN_MAJOR} ]]; then
             JAVA_STATUS="VALID"
-            JAVA_INFO="$( ${java_bin} -version 2>&1 | head -n1 )"
+            JAVA_INFO="$(java_version_line "${java_bin}")"
         else
             JAVA_STATUS="INVALID"
-            JAVA_INFO="Java major version ${major} is too old (need 17+). Will install JDK 21."
+            JAVA_INFO="Java major version ${major} is too old (need ${JAVA_MIN_MAJOR}+). Will install JDK 21."
         fi
     else
         JAVA_STATUS="MISSING"
@@ -350,15 +508,16 @@ check_sdk() {
 
 check_aapt2() {
     local bin=""
-    if command -v aapt2 &>/dev/null; then bin="$(command -v aapt2)";
-    elif command -v aapt &>/dev/null; then bin="$(command -v aapt)"; fi
+    command -v aapt2 &>/dev/null && bin="$(command -v aapt2)"
     if [[ -n "${bin}" ]] && aapt2_meets_minimum "${bin}"; then
         AAPT2_STATUS="VALID"
-        AAPT2_INFO="$( ${bin} version 2>&1 | head -n1 )"
+        AAPT2_INFO="$(aapt2_version_string "${bin}")"
         AAPT2_PATH="${bin}"
     else
+        # `aapt` (v1) is deliberately NOT used as a fallback: it cannot
+        # stand in for AAPT2 under AGP and only produced a false "VALID".
         AAPT2_STATUS="MISSING"
-        AAPT2_INFO="No working AAPT2 (with --source-path) found"
+        AAPT2_INFO="No working AAPT2 (with --source-path support) found"
     fi
 }
 
@@ -370,9 +529,15 @@ check_aapt2() {
 # (aapt) 2.19-11315950" or "2.19-debian". Fails (returns 1) when the
 # binary cannot be executed at all (missing, wrong architecture, ...).
 aapt2_version_string() {
-    local bin="$1"
+    local bin="$1" out=""
     [[ -x "${bin}" ]] || return 1
-    "${bin}" version 2>&1 | head -n1
+    # Captured in a variable rather than piped into `head`: the binary can
+    # be killed by SIGPIPE once head closes the pipe, and pipefail would
+    # then report a perfectly good binary as not runnable.
+    out="$("${bin}" version 2>&1 || true)"
+    [[ -z "${out}" ]] && return 1
+    printf '%s\n' "${out%%$'\n'*}"
+    return 0
 }
 
 # Numeric build id out of the version string ("2.19-11315950" ->
@@ -481,7 +646,7 @@ find_compatible_aapt2() {
             [[ -x "${c}" ]] && candidates+=("${c}")
         done
     fi
-    for p in "$(command -v aapt2 || true)" "$(command -v aapt || true)" \
+    for p in "$(command -v aapt2 || true)" \
              /usr/local/bin/aapt2 "${HOME}/.local/bin/aapt2" "${PREFIX:-}/bin/aapt2"; do
         [[ -n "${p}" && -x "${p}" ]] && candidates+=("${p}")
     done
@@ -508,9 +673,14 @@ find_compatible_aapt2() {
 # below the minimum requirement, so that the script can still finish
 # with exit status 0 and configure Gradle (issue #13, requirement 3).
 find_best_effort_aapt2() {
-    local c
-    for c in "$(command -v aapt2 || true)" "$(command -v aapt || true)" \
-             /usr/local/bin/aapt2 "${HOME}/.local/bin/aapt2"; do
+    local c candidates=()
+    if [[ -n "${SDK_ROOT:-}" && -d "${SDK_ROOT}/build-tools" ]]; then
+        for c in "${SDK_ROOT}"/build-tools/*/aapt2; do
+            [[ -x "${c}" ]] && candidates+=("${c}")
+        done
+    fi
+    candidates+=("$(command -v aapt2 || true)" /usr/local/bin/aapt2 "${HOME}/.local/bin/aapt2")
+    for c in "${candidates[@]}"; do
         if [[ -n "${c}" && -x "${c}" ]] && aapt2_version_string "${c}" &>/dev/null; then
             AAPT2_PATH="${c}"
             AAPT2_PROVENANCE="fallback"
@@ -557,7 +727,7 @@ install_system_aapt2() {
     esac
 
     local aapt2_bin
-    aapt2_bin="$(command -v aapt2 || command -v aapt || true)"
+    aapt2_bin="$(command -v aapt2 || true)"
     if [[ -z "${aapt2_bin}" ]]; then
         error "Failed to install system AAPT2."
         return 1
@@ -595,54 +765,145 @@ resolve_newest_platform() {
     return 0
 }
 
+# Discover the newest stable build-tools package ("build-tools;35.0.0").
+# Preview/rc builds are ignored; an empty result lets the caller fall back.
+resolve_newest_build_tools() {
+    local sdkmanager_bin="$1" listing best=""
+    listing="$("${sdkmanager_bin}" --list 2>/dev/null || true)"
+    [[ -z "${listing}" ]] && return 0
+    best="$(printf '%s\n' "${listing}" | \
+        sed -n 's/^[[:space:]]*build-tools;\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)[[:space:]].*/\1/p' | \
+        sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)"
+    [[ -n "${best}" ]] && echo "build-tools;${best}"
+    return 0
+}
+
+# Download a URL to a file, retrying transient failures. Returns non-zero
+# on HTTP errors (404/403/rate limit) so an error page is never written
+# to disk as if it were the artifact.
+download_file() {
+    local url="$1" dest="$2"
+    if command -v curl &>/dev/null; then
+        curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors \
+             --connect-timeout 20 --max-time 600 -o "${dest}" "${url}"
+    elif command -v wget &>/dev/null; then
+        wget -q --tries=3 --timeout=30 -O "${dest}" "${url}"
+    else
+        error "Neither curl nor wget is available."
+        return 1
+    fi
+}
+
+# Install one or more SDK packages, auto-answering the license prompt.
+# `yes` exits with SIGPIPE (141) as soon as sdkmanager stops reading;
+# run_pipeline keeps that from looking like a failed installation.
+sdkmanager_install() {
+    local sdkmanager_bin="$1" sdk_root="$2"; shift 2
+    export SDKMANAGER_BIN="${sdkmanager_bin}" SDK_ROOT_ARG="${sdk_root}"
+    run_pipeline bash -c 'yes | "$SDKMANAGER_BIN" --sdk_root="$SDK_ROOT_ARG" "$@"' \
+        _ "$@" >> "${LOG_FILE}" 2>&1
+    local rc=$?
+    unset SDKMANAGER_BIN SDK_ROOT_ARG
+    return ${rc}
+}
+
 install_sdk() {
     info "Setting up Android SDK (official Google command line tools)..."
     local sdk_root="${SDK_ROOT:-${HOME}/Android/Sdk}"
-    mkdir -p "${sdk_root}"
+    if ! mkdir -p "${sdk_root}"; then
+        error "Cannot create the SDK directory ${sdk_root}."
+        return 1
+    fi
 
     local sdkmanager_bin="${sdk_root}/cmdline-tools/latest/bin/sdkmanager"
     if [[ ! -x "${sdkmanager_bin}" ]]; then
         info "Downloading command line tools from Google..."
-        local tmp_zip="${sdk_root}/cmdline-tools.zip"
-        if ! wget -q --show-progress -O "${tmp_zip}" "${SDKMANAGER_URL}"; then
-            error "Download failed."
+        local tmp_zip
+        tmp_zip="$(mktemp "${sdk_root}/cmdline-tools.XXXXXX.zip" 2>/dev/null)" || {
+            error "Cannot create a temporary file in ${sdk_root}."
+            return 1
+        }
+        TMP_PATHS+=("${tmp_zip}")
+        if ! download_file "${SDKMANAGER_URL}" "${tmp_zip}"; then
+            error "Download failed: ${SDKMANAGER_URL}"
             return 1
         fi
-        [[ -n "${SDKMANAGER_SHA256}" ]] && {
+        # The archive must really be a ZIP, not an HTML error page.
+        if ! unzip -tq "${tmp_zip}" > /dev/null 2>&1; then
+            error "Downloaded command line tools archive is corrupt or not a ZIP file."
+            return 1
+        fi
+        if [[ -n "${SDKMANAGER_SHA256}" ]]; then
             local actual_sha
-            actual_sha=$(sha256sum "${tmp_zip}" | awk '{print $1}')
+            actual_sha="$(sha256sum "${tmp_zip}" | awk '{print $1}')"
             if [[ "${actual_sha}" != "${SDKMANAGER_SHA256}" ]]; then
-                error "Checksum mismatch for command line tools."
-                rm -f "${tmp_zip}"
+                error "Checksum mismatch for command line tools (got ${actual_sha})."
                 return 1
             fi
-        }
-        mkdir -p "${sdk_root}/cmdline-tools"
-        unzip -q -o "${tmp_zip}" -d "${sdk_root}/cmdline-tools"
-        mv "${sdk_root}/cmdline-tools/cmdline-tools" "${sdk_root}/cmdline-tools/latest"
-        rm -f "${tmp_zip}"
+        fi
+        # Drop a half-extracted tree left behind by an earlier failed run.
+        rm -rf "${sdk_root}/cmdline-tools/latest" "${sdk_root}/cmdline-tools/cmdline-tools"
+        if ! mkdir -p "${sdk_root}/cmdline-tools" || \
+           ! unzip -q -o "${tmp_zip}" -d "${sdk_root}/cmdline-tools"; then
+            error "Could not extract the command line tools."
+            return 1
+        fi
+        if ! mv "${sdk_root}/cmdline-tools/cmdline-tools" "${sdk_root}/cmdline-tools/latest"; then
+            error "Unexpected archive layout: cmdline-tools/ directory not found."
+            return 1
+        fi
         sdkmanager_bin="${sdk_root}/cmdline-tools/latest/bin/sdkmanager"
+        if [[ ! -f "${sdkmanager_bin}" ]]; then
+            error "sdkmanager is missing after extraction."
+            return 1
+        fi
+        chmod +x "${sdkmanager_bin}" 2>/dev/null || true
+        info "Command line tools installed."
     fi
 
     info "Accepting Android SDK licenses..."
-    yes | "${sdkmanager_bin}" --licenses > /dev/null 2>&1 || true
+    if ! sdkmanager_install "${sdkmanager_bin}" "${sdk_root}" --licenses; then
+        warn "License acceptance reported an error; continuing."
+    fi
 
     info "Installing platform-tools..."
-    yes | "${sdkmanager_bin}" --sdk_root="${sdk_root}" "platform-tools" > /dev/null
+    if ! sdkmanager_install "${sdkmanager_bin}" "${sdk_root}" "platform-tools"; then
+        error "Could not install platform-tools (see ${LOG_FILE})."
+        return 1
+    fi
 
     # Install the newest stable platform available (issue #13): a modern
     # android.jar on disk is required both for building current apps and
     # for the AAPT2 minimum-requirement probe. Older platforms that a
     # specific project needs are auto-downloaded by AGP (licenses are
-    # accepted above).
-    local platform_pkg
+    # accepted above). Each candidate is tried in turn because the newest
+    # advertised platform is not always installable from a given mirror.
+    local platform_pkg build_tools_pkg platform_ok=false candidate
+    local candidates=()
     platform_pkg="$(resolve_newest_platform "${sdkmanager_bin}")"
-    [[ -z "${platform_pkg}" ]] && platform_pkg="platforms;android-37.0"
-    info "Installing ${platform_pkg} and build-tools 35.0.0..."
-    yes | "${sdkmanager_bin}" --sdk_root="${sdk_root}" "${platform_pkg}" "build-tools;35.0.0" > /dev/null
+    build_tools_pkg="$(resolve_newest_build_tools "${sdkmanager_bin}")"
+    [[ -z "${build_tools_pkg}" ]] && build_tools_pkg="build-tools;35.0.0"
+    [[ -n "${platform_pkg}" ]] && candidates+=("${platform_pkg}")
+    candidates+=("platforms;android-36" "platforms;android-35")
+
+    for candidate in "${candidates[@]}"; do
+        info "Installing ${candidate} and ${build_tools_pkg}..."
+        if sdkmanager_install "${sdkmanager_bin}" "${sdk_root}" "${candidate}" "${build_tools_pkg}"; then
+            platform_ok=true
+            info "Installed ${candidate}."
+            break
+        fi
+        warn "Could not install ${candidate}; trying the next candidate."
+    done
+    [[ "${platform_ok}" == "true" ]] || \
+        warn "No SDK platform could be installed; AGP will try to download one at build time."
 
     SDK_ROOT="${sdk_root}"
-    SDK_STATUS="VALID"
+    if [[ -d "${sdk_root}/platform-tools" || -d "${sdk_root}/build-tools" ]]; then
+        SDK_STATUS="VALID"
+    else
+        SDK_STATUS="INCOMPLETE"
+    fi
 
     # Persist the SDK environment so that CI steps, fresh shells and
     # non-login shells all find the SDK (fixes "SDK location not found"
@@ -656,7 +917,10 @@ install_sdk() {
 # ----------------------------------------------------------------------
 write_env_exports() {
     local sdk_root="${SDK_ROOT:-${HOME}/Android/Sdk}"
-    mkdir -p "$(dirname "${ENV_FILE}")"
+    if ! mkdir -p "$(dirname "${ENV_FILE}")"; then
+        warn "Could not create ${STATE_DIR}; skipping ${ENV_FILE}."
+        return 1
+    fi
 
     info "Writing environment file ${ENV_FILE} ..."
     cat > "${ENV_FILE}" <<EOF
@@ -664,31 +928,44 @@ write_env_exports() {
 # the Android build environment: . "${ENV_FILE}"
 export ANDROID_HOME="${sdk_root}"
 export ANDROID_SDK_ROOT="${sdk_root}"
-case ":\$PATH:" in
-    *":\$ANDROID_HOME/cmdline-tools/latest/bin:"*) ;;
-    *) export PATH="\$ANDROID_HOME/cmdline-tools/latest/bin:\$ANDROID_HOME/platform-tools:\$PATH" ;;
-esac
+for _dir in "\$ANDROID_HOME/cmdline-tools/latest/bin" "\$ANDROID_HOME/platform-tools"; do
+    case ":\$PATH:" in
+        *":\$_dir:"*) ;;
+        *) PATH="\$_dir:\$PATH" ;;
+    esac
+done
+export PATH
+unset _dir
 if [ -z "\${JAVA_HOME:-}" ] && command -v java >/dev/null 2>&1; then
     _java_bin="\$(command -v java)"
-    [ -L "\$_java_bin" ] 2>/dev/null && _java_bin="\$(readlink -f "\$_java_bin")"
-    export JAVA_HOME="\$(dirname "\$(dirname "\$_java_bin")")"
+    [ -L "\$_java_bin" ] && _java_bin="\$(readlink -f "\$_java_bin")"
+    JAVA_HOME="\$(dirname "\$(dirname "\$_java_bin")")"
+    export JAVA_HOME
     unset _java_bin
 fi
 EOF
     if [[ -n "${AAPT2_PATH:-}" && -x "${AAPT2_PATH}" ]]; then
-        echo "export GRADLE_OPTS=\"-Dandroid.aapt2FromMavenOverride=${AAPT2_PATH}\"" >> "${ENV_FILE}"
+        # Appended to any GRADLE_OPTS the user already set (e.g. -Xmx2g)
+        # instead of overwriting them.
+        cat >> "${ENV_FILE}" <<EOF
+GRADLE_OPTS="\${GRADLE_OPTS:+\$GRADLE_OPTS }-Dandroid.aapt2FromMavenOverride=${AAPT2_PATH}"
+export GRADLE_OPTS
+EOF
     fi
 
     # Also export ANDROID_HOME in interactive shell rc files so that
     # Gradle finds the SDK in new terminals on every distro and Termux.
+    local rc
     for rc in "${HOME}/.bashrc" "${HOME}/.zshrc"; do
-        if [[ -f "${rc}" ]]; then
-            sed -i '/^export ANDROID_HOME=/d; /^export ANDROID_SDK_ROOT=/d' "${rc}"
+        # Never create a ~/.zshrc for users who do not use zsh.
+        [[ "${rc}" == "${HOME}/.zshrc" && ! -f "${rc}" ]] && continue
+        rc_drop_managed "${rc}"
+        rc_set_line "${rc}" "# arm64-android-build-env (managed block)"
+        rc_set_line "${rc}" "export ANDROID_HOME=\"${sdk_root}\""
+        rc_set_line "${rc}" "export ANDROID_SDK_ROOT=\"${sdk_root}\""
+        if [[ -n "${AAPT2_PATH:-}" && -x "${AAPT2_PATH}" ]]; then
+            rc_set_line "${rc}" "GRADLE_OPTS=\"\${GRADLE_OPTS:+\$GRADLE_OPTS }-Dandroid.aapt2FromMavenOverride=${AAPT2_PATH}\"; export GRADLE_OPTS"
         fi
-        {
-            echo "export ANDROID_HOME=\"${sdk_root}\""
-            echo "export ANDROID_SDK_ROOT=\"${sdk_root}\""
-        } >> "${rc}"
     done
     export ANDROID_HOME="${sdk_root}"
     export ANDROID_SDK_ROOT="${sdk_root}"
@@ -697,47 +974,43 @@ EOF
 # ----------------------------------------------------------------------
 # Download and install ReVanced AAPT2 (robust, with graceful fallback)
 # ----------------------------------------------------------------------
+# Print the ELF machine type of a binary: aarch64, x86_64 or unknown.
+# Bytes 18-19 of the ELF header hold e_machine (0xB7 = AArch64).
+elf_machine() {
+    local f="$1" m=""
+    m="$(od -An -j18 -N2 -tx1 "${f}" 2>/dev/null | tr -d ' \n')"
+    case "${m}" in
+        b700) echo "aarch64" ;;
+        3e00) echo "x86_64" ;;
+        *)    echo "unknown" ;;
+    esac
+}
+
 install_revanced_aapt2() {
-    info "Downloading ReVanced ARM64 AAPT2 with redirect following..."
+    info "Downloading ReVanced ARM64 AAPT2..."
     local target_path="/usr/local/bin/aapt2"
     if [[ ! -w "$(dirname "${target_path}")" ]]; then
         target_path="${HOME}/.local/bin/aapt2"
-        mkdir -p "$(dirname "${target_path}")"
+        if ! mkdir -p "$(dirname "${target_path}")"; then
+            error "Cannot create ${HOME}/.local/bin."
+            return 1
+        fi
     fi
     local tmp="${target_path}.tmp"
+    TMP_PATHS+=("${tmp}")
 
-    local downloaded=false
-    if command -v curl &>/dev/null; then
-        # -f: an HTTP error (404/403 rate-limit/proxy page) must FAIL the
-        # download instead of silently writing the error body to disk;
-        # retries tolerate transient network failures.
-        if curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors \
-                -o "${tmp}" "${REVANCED_AAPT2_URL}"; then
-            downloaded=true
-        else
-            error "curl download failed (HTTP error or network failure)."
-        fi
-    elif command -v wget &>/dev/null; then
-        if wget -q --tries=3 -O "${tmp}" "${REVANCED_AAPT2_URL}"; then
-            downloaded=true
-        else
-            error "wget download failed."
-        fi
-    else
-        error "Neither curl nor wget is available."
-        return 1
-    fi
-
-    if [[ "${downloaded}" != "true" ]]; then
+    if ! download_file "${REVANCED_AAPT2_URL}" "${tmp}"; then
+        error "Download failed (HTTP error or network failure): ${REVANCED_AAPT2_URL}"
         rm -f "${tmp}"
         return 1
     fi
 
     # Sanity: the file must be a reasonably sized ELF binary, not an HTML
-    # error page or a truncated response.
-    local size magic
+    # error page, a truncated response or a binary for another CPU.
+    local size magic machine
     size=$(stat -c%s "${tmp}" 2>/dev/null || echo 0)
     magic=$(head -c 4 "${tmp}" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')
+    machine="$(elf_machine "${tmp}")"
     if [[ "${size}" -lt 1000000 || "${magic}" != "7f454c46" ]]; then
         error "Downloaded file is not a valid AAPT2 ELF binary (size=${size} bytes, magic=${magic:-none})."
         local first_bytes
@@ -746,11 +1019,24 @@ install_revanced_aapt2() {
         rm -f "${tmp}"
         return 1
     fi
+    if [[ "${machine}" != "aarch64" ]]; then
+        error "Downloaded AAPT2 is built for '${machine}', not aarch64; refusing to install it."
+        rm -f "${tmp}"
+        return 1
+    fi
 
-    chmod +x "${tmp}"
+    if ! chmod +x "${tmp}" 2>/dev/null; then
+        error "Cannot make ${tmp} executable."
+        rm -f "${tmp}"
+        return 1
+    fi
 
     if aapt2_meets_minimum "${tmp}"; then
-        mv -f "${tmp}" "${target_path}"
+        if ! mv -f "${tmp}" "${target_path}"; then
+            error "Could not move the validated binary to ${target_path}."
+            rm -f "${tmp}"
+            return 1
+        fi
         AAPT2_PATH="${target_path}"
         AAPT2_PROVENANCE="revanced"
         info "ReVanced AAPT2 installed and validated at ${AAPT2_PATH}"
@@ -759,7 +1045,7 @@ install_revanced_aapt2() {
 
     # Keep diagnostics in the log before discarding the bad binary.
     error "Downloaded ReVanced binary did not pass the minimum-requirement validation."
-    error "  validation output: $(${tmp} compile --help 2>&1 | head -n 3 | tr '\n' ' ')"
+    error "  version output: $(aapt2_version_string "${tmp}" 2>&1)"
     rm -f "${tmp}"
     return 1
 }
@@ -830,22 +1116,34 @@ if (chosenAapt2 != null && chosenAapt2!!.exists()) {
 }
 EOF
 
-    # Shell RC GRADLE_OPTS
-    local export_line="export GRADLE_OPTS=\"-Dandroid.aapt2FromMavenOverride=${aapt2_bin}\""
+    # Shell RC GRADLE_OPTS — appended to whatever the user already had;
+    # a bare assignment used to wipe settings such as -Xmx2g.
+    local rc gradle_line
+    gradle_line="GRADLE_OPTS=\"\${GRADLE_OPTS:+\$GRADLE_OPTS }-Dandroid.aapt2FromMavenOverride=${aapt2_bin}\"; export GRADLE_OPTS"
     for rc in "${HOME}/.bashrc" "${HOME}/.zshrc"; do
-        if [[ -f "${rc}" ]]; then
-            sed -i '/^export GRADLE_OPTS=/d' "${rc}"
-            echo "${export_line}" >> "${rc}"
-        else
-            echo "${export_line}" > "${rc}"
-        fi
+        # Never create a ~/.zshrc for users who do not use zsh.
+        [[ "${rc}" == "${HOME}/.zshrc" && ! -f "${rc}" ]] && continue
+        sed -i '/^GRADLE_OPTS=.*aapt2FromMavenOverride=/d; /^export GRADLE_OPTS=.*aapt2FromMavenOverride=/d' \
+            "${rc}" 2>/dev/null
+        rc_set_line "${rc}" "# arm64-android-build-env (managed block)"
+        rc_set_line "${rc}" "${gradle_line}"
     done
-    export GRADLE_OPTS="-Dandroid.aapt2FromMavenOverride=${aapt2_bin}"
+    case " ${GRADLE_OPTS:-} " in
+        *"android.aapt2FromMavenOverride="*) ;;
+        *) GRADLE_OPTS="${GRADLE_OPTS:+${GRADLE_OPTS} }-Dandroid.aapt2FromMavenOverride=${aapt2_bin}" ;;
+    esac
+    export GRADLE_OPTS
 
-    # Stop Gradle daemons
+    # Stop running Gradle daemons so the override takes effect.
+    # NOTE: the old code ran `./gradlew --stop` in the *current* directory
+    # (not a Gradle project when the script runs from $HOME) and
+    # `pkill -f gradle`, which also killed unrelated processes whose
+    # command line merely contained "gradle" (editors, other builds).
     info "Stopping Gradle daemons..."
-    ./gradlew --stop > /dev/null 2>&1 || true
-    pkill -f gradle > /dev/null 2>&1 || true
+    if command -v gradle &>/dev/null; then
+        run_quietly gradle --stop || debug "gradle --stop returned non-zero."
+    fi
+    pkill -f 'org\.gradle\.launcher\.daemon\.GradleDaemon' > /dev/null 2>&1 || true
 
     # Refresh the environment file so CI steps also get GRADLE_OPTS
     write_env_exports
@@ -860,6 +1158,32 @@ EOF
 }
 
 # ----------------------------------------------------------------------
+# State file (records what this run installed; handy for support/debug)
+# ----------------------------------------------------------------------
+json_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+write_state() {
+    mkdir -p "${STATE_DIR}" 2>/dev/null || return 0
+    local tmp="${STATE_FILE}.tmp"
+    {
+        printf '{\n'
+        printf '  "tool": "%s",\n' "${TOOL_NAME}"
+        printf '  "version": "%s",\n' "${TOOL_VERSION}"
+        printf '  "updated_at": "%s",\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        printf '  "os": "%s",\n' "${OS_NAME:-unknown}"
+        printf '  "arch": "%s",\n' "${ARCH:-unknown}"
+        printf '  "java_home": "%s",\n' "$(json_escape "${JAVA_HOME:-}")"
+        printf '  "android_sdk_root": "%s",\n' "$(json_escape "${SDK_ROOT:-}")"
+        printf '  "aapt2_path": "%s",\n' "$(json_escape "${AAPT2_PATH:-}")"
+        printf '  "aapt2_provenance": "%s"\n' "$(json_escape "${AAPT2_PROVENANCE:-}")"
+        printf '}\n'
+    } > "${tmp}" 2>/dev/null && mv -f "${tmp}" "${STATE_FILE}" 2>/dev/null
+    debug "State written to ${STATE_FILE}"
+}
+
+# ----------------------------------------------------------------------
 # Main Flow
 # ----------------------------------------------------------------------
 main() {
@@ -868,18 +1192,14 @@ main() {
     echo "=================================================="
     echo "This script will set up the ARM64 Android build environment."
     echo "It will install required packages and configure Gradle."
+    echo "Log file: ${LOG_FILE}"
     echo "=================================================="
-    read -p "Do you want to proceed with setup? [y/N]: " -r initial_confirm || initial_confirm=""
-    if [[ ! -t 0 && -z "${initial_confirm}" ]]; then
-        # Non-interactive context (CI, `curl | bash`, piped stdin): the
-        # recommended answer is applied automatically instead of aborting.
-        initial_confirm="y"
-        info "Non-interactive session detected; proceeding with setup automatically."
-    fi
-    if [[ ! "${initial_confirm}" =~ ^[Yy]$ ]]; then
+    if ! ask_yes_no "Do you want to proceed with setup? [y/N]:" N Y; then
         info "Aborted by user."
         exit 0
     fi
+    [[ "${INTERACTIVE}" != "true" ]] && \
+        info "Non-interactive session detected; proceeding with setup automatically."
 
     detect_os
 
@@ -914,6 +1234,10 @@ main() {
 
     if [[ "${CHECK_ONLY}" == "true" ]]; then
         info "Check mode: no changes made."
+        if [[ "${JAVA_STATUS}" != "VALID" || "${SDK_STATUS}" != "VALID" || "${AAPT2_STATUS}" != "VALID" ]]; then
+            echo ""
+            echo "Run without --check to install and configure the missing parts."
+        fi
         exit 0
     fi
 
@@ -956,25 +1280,15 @@ main() {
         if find_compatible_aapt2; then
             info "System AAPT2 now satisfies the minimum version requirement; skipping ReVanced download."
         else
-            if [[ "${OS_NAME}" == "termux" ]]; then
-                echo ""
-                read -p "Do you want to install ReVanced ARM64 AAPT2? [Y/n]: " -r use_revanced || use_revanced=""
-            else
+            if [[ "${OS_NAME}" != "termux" ]]; then
                 echo ""
                 echo "============================================================"
-                echo "WARNING: System official repository's AAPT2 on Debian/Ubuntu/Kali/Arch is outdated and lacks '--source-path' support required by modern AGP."
+                echo "WARNING: The AAPT2 shipped by Debian/Ubuntu/Kali/Arch repositories is outdated and lacks '--source-path' support required by modern AGP."
                 echo "RECOMMENDED: ReVanced Team provides an open-source, up-to-date ARM64 AAPT2 binary."
                 echo "============================================================"
                 echo ""
-                read -p "Do you want to download and install ReVanced ARM64 AAPT2? [Y/n]: " -r use_revanced || use_revanced=""
             fi
-            if [[ ! -t 0 && -z "${use_revanced}" ]]; then
-                # Non-interactive (CI / piped stdin): take the recommended choice.
-                use_revanced="Y"
-                info "Non-interactive session detected; using the recommended ReVanced AAPT2."
-            fi
-            use_revanced="${use_revanced:-Y}"
-            if [[ "${use_revanced}" =~ ^[Yy]$ ]]; then
+            if ask_yes_no "Do you want to download and install ReVanced ARM64 AAPT2? [Y/n]:" Y Y; then
                 if ! install_revanced_aapt2; then
                     # Requirement 3: graceful fallback, keep exit status 0.
                     warn "ReVanced AAPT2 could not be installed; falling back to the best available AAPT2."
@@ -997,13 +1311,15 @@ main() {
     # Final status
     check_java
     check_sdk
-    if [[ -n "${AAPT2_PATH}" && -x "${AAPT2_PATH}" ]]; then
+    if [[ -n "${AAPT2_PATH:-}" && -x "${AAPT2_PATH}" ]]; then
         AAPT2_STATUS="VALID"
-        AAPT2_INFO="$( ${AAPT2_PATH} version 2>&1 | head -n1 )"
+        AAPT2_INFO="$(aapt2_version_string "${AAPT2_PATH}")"
     else
         AAPT2_STATUS="INVALID"
         AAPT2_INFO="AAPT2 not found or not executable"
     fi
+
+    write_state
 
     echo ""
     echo "================================================"
@@ -1014,12 +1330,28 @@ main() {
     echo "AAPT2               : ${AAPT2_STATUS} - ${AAPT2_INFO}"
     echo "AAPT2 Path          : ${AAPT2_PATH:-N/A} (${AAPT2_PROVENANCE:-n/a})"
     echo "Environment file    : ${ENV_FILE}"
+    echo "Log file            : ${LOG_FILE}"
     echo "================================================"
+
     if [[ "${JAVA_STATUS}" == "VALID" && "${SDK_STATUS}" == "VALID" && "${AAPT2_STATUS}" == "VALID" ]]; then
         info "Environment is ready for ARM64 Android builds."
-    else
-        warn "Some components are still not ready. Please review the output above."
+        info "Open a new shell, or run: . \"${ENV_FILE}\""
+        exit 0
     fi
+
+    warn "Some components are still not ready. Please review the output above."
+    echo ""
+    echo "Next steps:"
+    echo "  - Re-run with --verbose, or read the log: ${LOG_FILE}"
+    echo "  - Load the environment manually: . \"${ENV_FILE}\""
+    echo "  - Use --strict to make this run exit non-zero."
+    if [[ "${STRICT}" == "true" ]]; then
+        error "--strict: exiting with status 1 because the environment is not fully ready."
+        exit 1
+    fi
+    # Default behaviour is unchanged: a partially configured machine still
+    # exits 0 so CI pipelines are not broken by an AAPT2 fallback.
+    exit 0
 }
 
 main "$@"

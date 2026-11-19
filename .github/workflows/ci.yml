@@ -1,0 +1,58 @@
+name: CI
+
+# Runs on every pull request (and on pushes to main) so a change to the
+# installer cannot be merged without the tests passing.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Security: read-only token, no credentials left behind on the runner.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    name: Lint & tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install ShellCheck
+        run: command -v shellcheck >/dev/null || { sudo apt-get update && sudo apt-get install -y shellcheck; }
+
+      - name: ShellCheck (errors and warnings)
+        run: |
+          shellcheck --version
+          shellcheck -S warning Install.sh tests/unit.sh tests/e2e.sh
+
+      - name: Bash syntax check
+        run: bash -n Install.sh
+
+      - name: Installer CLI smoke test
+        run: |
+          ./Install.sh --version
+          ./Install.sh --help
+          # An unknown flag must fail with a clear message.
+          if ./Install.sh --definitely-not-a-flag; then
+            echo "unknown option was accepted"; exit 1
+          fi
+
+      - name: Unit tests (Java parsing, AAPT2 probes, ELF arch, env/rc/state)
+        run: bash tests/unit.sh
+
+      - name: End-to-end tests (stubbed ARM64 machine, no network)
+        run: bash tests/e2e.sh
+
+  # The real ARM64 install + APK build lives in test-build.yml and is also
+  # triggered by pull_request, so every PR gets the hardware-level proof.
